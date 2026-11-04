@@ -1,0 +1,9 @@
+#!/usr/bin/python3
+"""eris-bot: a Telegram bot for this server (see eris-bot help)."""
+import os
+import sys
+
+sys.path.insert(0, os.environ.get("ERISBOT_LIB", "/usr/local/lib/eris-bot"))
+from erisbot.cli import run  # noqa: E402
+
+run()

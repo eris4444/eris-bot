@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # the ERIS Console release the bot is tested with (eris backup ... --json, eris fw, erisd.alerts)
+  ERIS_CONSOLE_REF: v2.5.0
+
+jobs:
+  test:
+    name: build, lint, unit tests (debian:trixie)
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - name: Tools
+        run: |
+          apt-get update -q
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+            python3 shellcheck openssl ca-certificates git
+      - uses: actions/checkout@v5
+      - name: Build install-eris-bot.sh
+        run: bash src/build.sh /tmp/install-eris-bot.sh
+      - name: The committed install-eris-bot.sh is the built one
+        run: cmp /tmp/install-eris-bot.sh install-eris-bot.sh
+      - name: bash -n
+        run: for f in install-eris-bot.sh src/install-head.sh src/build.sh src/eris-bot-uninstall tests/*.sh; do bash -n "$f"; done
+      - name: shellcheck
+        run: |
+          shellcheck --version | head -n 2
+          shellcheck -S warning install-eris-bot.sh src/install-head.sh src/build.sh src/eris-bot-uninstall tests/*.sh
+      - name: Python syntax
+        run: python3 -m py_compile src/erisbot/*.py src/eris-bot tests/*.py
+      - name: Unit tests (mock Bot API, Marzban, proxies, fake /sys)
+        run: python3 -m unittest discover -s tests -v
+
+  real-eris:
+    name: with the real ERIS Console
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - name: Tools
+        run: |
+          apt-get update -q
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends python3 openssl ca-certificates git
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: eris4444/eris-console
+          ref: ${{ env.ERIS_CONSOLE_REF }}
+          path: eris-console
+      - name: eris backup --json, encrypt and alerts() with the bot
+        run: |
+          grep -n '^VERSION' eris-console/src/erislib.py
+          ERIS_CONSOLE_SRC=$PWD/eris-console/src python3 -m unittest discover -s tests -p test_real_eris.py -v 2>&1 | tee /tmp/out
+          ! grep -q "skipped" /tmp/out
+
+  install:
+    name: real install in a systemd container
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: install-eris-bot.sh in debian:trixie with systemd, a mock Bot API, upgrade, uninstall
+        run: bash tests/ci-install.sh
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, real-eris, install]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build and check the version
+        run: |
+          bash src/build.sh "$PWD/install-eris-bot.sh"
+          v=$(sed -n 's/^VERSION=//p' src/install-head.sh)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME but VERSION=$v"; exit 1; }
+          grep -q "^VERSION = \"$v\"" src/erisbot/__init__.py
+          awk -v v="$v" '$0 ~ "^## " v {on=1; next} /^## / {on=0} on' CHANGELOG.md > notes.md
+          cat notes.md
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" install-eris-bot.sh --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" install-eris-bot.sh --title "eris-bot ${GITHUB_REF_NAME#v}" --notes-file notes.md --latest
+          fi
