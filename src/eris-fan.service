@@ -1,0 +1,20 @@
+[Unit]
+Description=eris-bot fan control (fans go back to the BIOS when it stops)
+Documentation=https://github.com/eris4444/eris-bot
+After=systemd-modules-load.service eris-bot.service
+# stops (and gives the fans back to the BIOS) whenever eris-bot stops or crashes
+BindsTo=eris-bot.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/bin/eris-bot fan-daemon
+# whatever happened to the daemon (even kill -9): the original pwm_enable of every fan comes back
+ExecStopPost=/usr/local/bin/eris-bot fan-restore
+Restart=always
+RestartSec=3
+WatchdogSec=20
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=eris-bot.service

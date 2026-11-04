@@ -1,0 +1,40 @@
+#!/bin/bash
+# eris-bot-uninstall: remove eris-bot and put back what it changed.
+# The settings and state are kept in /var/backups/eris-bot/uninstall-<time>/.
+set -u
+[ "$(id -u)" -eq 0 ] || { echo "eris-bot-uninstall: run as root" >&2; exit 1; }
+LOG=/var/log/eris-bot-install.log
+say() { printf '[eris-bot] %s\n' "$*"; printf '%s [uninstall] %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
+KEEP=/var/backups/eris-bot/uninstall-$(date +%Y%m%d-%H%M%S)
+
+# 1. the CPU settings of the profile back to how they were, then the services (fans back to the BIOS)
+if [ -x /usr/local/bin/eris-bot ]; then
+  /usr/local/bin/eris-bot profile-reset > /dev/null 2>&1 && say "profile: CPU settings and fans back to the system defaults"
+fi
+for u in eris-fan.service eris-bot.service; do
+  if systemctl cat "$u" > /dev/null 2>&1; then
+    timeout 60 systemctl disable --now "$u" > /dev/null 2>&1
+    say "stopped and disabled $u"
+  fi
+done
+[ -x /usr/local/bin/eris-bot ] && /usr/local/bin/eris-bot fan-restore > /dev/null 2>&1
+
+# 2. settings and state are kept, then removed
+mkdir -p "$KEEP"
+chmod 700 "$KEEP"
+for p in /etc/eris-bot /var/lib/eris-bot; do
+  [ -e "$p" ] && cp -a "$p" "$KEEP/" && rm -rf "$p"
+done
+say "settings and state kept in $KEEP (config.json holds the bot token: keep it private)"
+
+# 3. files
+rm -f /etc/systemd/system/eris-bot.service /etc/systemd/system/eris-fan.service
+rm -rf /etc/systemd/system/eris-bot.service.wants
+rm -rf /usr/local/lib/eris-bot /run/eris-bot /var/tmp/eris-bot
+rm -f /usr/local/bin/eris-bot
+for f in /etc/modules-load.d/eris-bot-fans.conf /etc/modprobe.d/eris-bot-fans.conf; do
+  [ -e "$f" ] && mv -f "$f" "$KEEP/" && say "fan driver settings moved to $KEEP ($(basename "$f"))"
+done
+systemctl daemon-reload > /dev/null 2>&1
+rm -f /usr/local/sbin/eris-bot-uninstall
+say "eris-bot removed"

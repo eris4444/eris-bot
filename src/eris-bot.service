@@ -1,0 +1,18 @@
+[Unit]
+Description=eris-bot, the Telegram bot of this server
+Documentation=https://github.com/eris4444/eris-bot
+After=network-online.target
+Wants=network-online.target eris-fan.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/eris-bot run
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+Nice=5
+# root: it reads /opt/marzban/.env, runs eris, systemctl and docker, and writes /sys for the fans
+
+[Install]
+WantedBy=multi-user.target
