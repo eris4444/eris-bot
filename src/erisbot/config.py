@@ -33,6 +33,7 @@ MARZBAN_ENV = R("/opt/marzban/.env")
 CERTS = R("/etc/xray-site/certs")
 MODULES_LOAD = R("/etc/modules-load.d/eris-bot-fans.conf")
 MODPROBE_D = R("/etc/modprobe.d/eris-bot-fans.conf")
+GRUB = R("/etc/default/grub")
 SENSORS_DETECT = os.environ.get("ERISBOT_SENSORS_DETECT", "/usr/sbin/sensors-detect")
 
 PARTS = ("marzban", "x-ui", "xray-site", "jellyfin", "eris", "claude-f-web", "system")

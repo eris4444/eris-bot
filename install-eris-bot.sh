@@ -7,7 +7,7 @@
 #   bash install-eris-bot.sh --no-selftest  skip the checks at the end
 # After the first install: eris-bot setup
 set -euo pipefail
-VERSION=1.0.0
+VERSION=1.1.0
 LOG=/var/log/eris-bot-install.log
 TS=$(date +%Y%m%d-%H%M%S)
 BK=/var/backups/eris-bot/$TS
@@ -74,7 +74,7 @@ write_files() {
 
 Python 3 standard library only.
 """
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 REPO = "eris4444/eris-bot"
 ERISBOT_EOF___init___py
   put_file "$STAGE/erisbot/alerts.py" 0644 << 'ERISBOT_EOF_alerts_py'
@@ -1554,6 +1554,7 @@ MARZBAN_ENV = R("/opt/marzban/.env")
 CERTS = R("/etc/xray-site/certs")
 MODULES_LOAD = R("/etc/modules-load.d/eris-bot-fans.conf")
 MODPROBE_D = R("/etc/modprobe.d/eris-bot-fans.conf")
+GRUB = R("/etc/default/grub")
 SENSORS_DETECT = os.environ.get("ERISBOT_SENSORS_DETECT", "/usr/sbin/sensors-detect")
 
 PARTS = ("marzban", "x-ui", "xray-site", "jellyfin", "eris", "claude-f-web", "system")
@@ -2167,8 +2168,10 @@ ERISBOT_EOF_fand_py
 Nothing here raises the FSB or the voltage: on Core 2 / G41 that is only safe from the BIOS.
 """
 import glob
+import json
 import os
 import re
+import time
 
 from . import config, system
 from .util import read, read_int, write
@@ -2210,7 +2213,20 @@ def fans():
                    "temp": os.path.join(d, "temp1_input") if kind == "gpu" and os.path.exists(os.path.join(d, "temp1_input")) else None}
             fan["label"] = ("فن کارت گرافیک" if kind == "gpu" else "فن CPU/کیس") + " (%s pwm%s)" % (chip, n)
             out.append(fan)
+    names = fan_names()
+    for f in out:
+        if names.get(f["id"]):
+            f["label"] = names[f["id"]]
     return out
+
+
+def fan_names():
+    """Names found by the pwm test ({fan id: label}), kept in fans.json."""
+    try:
+        with open(config.FANS, encoding="utf-8") as fh:
+            return (json.load(fh) or {}).get("names") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
 
 
 def pwm_range(fan):
@@ -2358,7 +2374,7 @@ def sensors_detect():
     return (r.stdout + r.stderr), r.returncode
 
 
-def modprobe(driver, force_id=None):
+def modprobe(driver, force_id=None, options=None):
     if driver not in FAN_DRIVERS:
         raise ValueError("not a fan driver: %s" % driver)
     args = ["modprobe", driver]
@@ -2366,19 +2382,171 @@ def modprobe(driver, force_id=None):
         if not re.fullmatch(r"0x[0-9a-fA-F]{4}", force_id):
             raise ValueError("bad force_id")
         args.append("force_id=%s" % force_id)
+    if options:
+        if options not in CONFLICT_OPTS.values():
+            raise ValueError("bad module option")
+        args.append(options)
     return system.sh(args, timeout=60)
 
 
-def persist_driver(driver, force_id=None):
-    """Load the driver at every boot (/etc/modules-load.d/eris-bot-fans.conf, force_id in /etc/modprobe.d)."""
+def unload(driver):
+    if driver in FAN_DRIVERS:
+        system.sh(["modprobe", "-r", driver], timeout=60)
+
+
+def persist_driver(driver, force_id=None, options=None):
+    """Load the driver at every boot (/etc/modules-load.d/eris-bot-fans.conf; its options in /etc/modprobe.d)."""
     have = (read(config.MODULES_LOAD, "") or "").split()
     lines = ["# fan controllers found by eris-bot (eris-bot removes this file on uninstall)"]
     lines += sorted(set([d for d in have if not d.startswith("#") and d in FAN_DRIVERS] + [driver]))
     os.makedirs(os.path.dirname(config.MODULES_LOAD), exist_ok=True)
     write(config.MODULES_LOAD, "\n".join(lines) + "\n")
-    if force_id:
+    opts = " ".join(x for x in ("force_id=%s" % force_id if force_id else "", options or "") if x)
+    if opts:
         os.makedirs(os.path.dirname(config.MODPROBE_D), exist_ok=True)
-        write(config.MODPROBE_D, "# written by eris-bot\noptions %s force_id=%s\n" % (driver, force_id))
+        write(config.MODPROBE_D, "# written by eris-bot\noptions %s %s\n" % (driver, opts))
+
+
+# ---------------------------------------------------------------- finding the CPU fan controller by itself
+
+# Super I/O drivers check the chip ID themselves and refuse to load on another chip, so trying them one
+# by one is safe (unlike force_id). The usual chips of G41/ICH7 boards first.
+TRY_ORDER = ("it87", "w83627ehf", "nct6775", "w83627hf", "f71882fg", "f71805f", "smsc47m1", "pc87360", "sch5627")
+CONFLICT_RX = re.compile(r"resource conflict|conflicts with ACPI|ACPI region|acpi_enforce_resources", re.I)
+# a module option that lets the driver share its ports with an ACPI claim of the BIOS
+CONFLICT_OPTS = {"it87": "ignore_resource_conflict=1"}
+
+
+def kernel_log(lines=60):
+    r = system.sh(["dmesg"], timeout=20)
+    return "\n".join((r.stdout or "").splitlines()[-lines:])
+
+
+def module_loaded(driver):
+    mods = read(system.P("/proc/modules"), "") or ""
+    return any(line.split(" ", 1)[0] == driver for line in mods.splitlines())
+
+
+def cpu_fans():
+    return [f for f in fans() if f["kind"] == "cpu"]
+
+
+def pwm_test(fan, settle=6.0, sleep=time.sleep):
+    """Does this pwm really drive a fan? 100 %, then 35 %; a fan input that slows down by 15 % or more
+    is the fan it drives. The pwm and pwm_enable are put back afterwards whatever happens."""
+    inputs = sorted(glob.glob(os.path.join(fan["dir"], "fan*_input")))
+    en0 = read(fan["enable"]) if fan.get("enable") else None
+    pwm0 = read(fan["pwm"])
+    res = {"ok": False, "input": None, "hi": None, "lo": None}
+    try:
+        if fan.get("enable"):
+            write(fan["enable"], "1")
+        write(fan["pwm"], pct_to_pwm(fan, 100))
+        sleep(settle)
+        hi = {i: read_int(i) or 0 for i in inputs}
+        write(fan["pwm"], pct_to_pwm(fan, 35))
+        sleep(settle)
+        lo = {i: read_int(i) or 0 for i in inputs}
+        best = max(inputs, key=lambda i: hi[i] - lo[i], default=None)
+        if best and hi[best] > 0 and lo[best] <= hi[best] * 0.85:
+            res.update(ok=True, input=os.path.basename(best).split("_")[0], hi=hi[best], lo=lo[best])
+        elif best:
+            res.update(hi=hi[best], lo=lo[best])
+    except OSError as e:
+        res["error"] = str(e)
+    finally:
+        try:
+            if pwm0 is not None:
+                write(fan["pwm"], pwm0)
+            if fan.get("enable") and en0 is not None:
+                write(fan["enable"], "2" if en0 == "1" else en0)
+        except OSError:
+            pass
+    return res
+
+
+def save_name(fan_id, label):
+    try:
+        with open(config.FANS, encoding="utf-8") as fh:
+            data = json.load(fh) or {}
+    except (OSError, ValueError):
+        data = {}
+    data.setdefault("fans", {})
+    data.setdefault("names", {})[fan_id] = label
+    config.write_json(config.FANS, data, 0o600)
+
+
+def auto_detect(progress=lambda text: None, settle=6.0, sleep=time.sleep):
+    """Find a driver that gives the CPU/case fans a pwm, keep it for the next boots and test each pwm.
+    Returns {"driver", "options", "fans": [(fan, test)], "steps": [...], "conflict": bool, "sensors": text}."""
+    rep = {"driver": None, "options": None, "fans": [], "steps": [], "conflict": False, "sensors": None}
+    cands = []
+    if os.path.exists(config.SENSORS_DETECT):
+        progress("sensors-detect --auto …")
+        out, _ = sensors_detect()
+        rep["sensors"] = out
+        p = parse_sensors_detect(out)
+        cands += p["fan_drivers"]
+        rep["unknown_ids"] = p["unknown_ids"]
+    cands += [d for d in TRY_ORDER if d not in cands]
+    if cpu_fans():
+        rep["steps"].append("قبلاً هم pwm برای فن CPU/کیس هست")
+    for drv in cands:
+        if cpu_fans():
+            break
+        was = module_loaded(drv)
+        progress("امتحان درایور %s …" % drv)
+        r = modprobe(drv)
+        found = cpu_fans()
+        log = (r.stderr or "") + "\n" + kernel_log()
+        conflict = bool(CONFLICT_RX.search(log)) and drv in log
+        if not found and drv in CONFLICT_OPTS and (conflict or r.returncode != 0):
+            unload(drv)
+            progress("%s با %s …" % (drv, CONFLICT_OPTS[drv]))
+            r = modprobe(drv, options=CONFLICT_OPTS[drv])
+            found = cpu_fans()
+            if found:
+                rep["options"] = CONFLICT_OPTS[drv]
+        rep["conflict"] |= conflict
+        if found:
+            rep["driver"] = drv
+            rep["steps"].append("✅ %s: %d خروجی pwm" % (drv, len(found)))
+            break
+        rep["steps"].append("✖️ %s: %s" % (drv, "تداخل با ACPI" if conflict else ("چیپ این درایور نیست" if r.returncode else "لود شد ولی pwm نداد")))
+        if not was and module_loaded(drv):
+            unload(drv)
+    for f in cpu_fans():
+        progress("تست %s (۱۰۰٪ و ۳۵٪) …" % f["label"])
+        t = pwm_test(f, settle, sleep)
+        rep["fans"].append((f, t))
+        if t["ok"]:
+            save_name(f["id"], "فن CPU/کیس %s (%s pwm%s)" % (t["input"], f["chip"], f["n"]))
+    if rep["driver"]:
+        persist_driver(rep["driver"], options=rep["options"])
+    return rep
+
+
+def acpi_lax():
+    """Add acpi_enforce_resources=lax to the kernel command line (GRUB); works after a reboot.
+    Returns (changed, message)."""
+    text = read(config.GRUB)
+    if text is None:
+        return False, "%s نیست" % config.GRUB
+    if "acpi_enforce_resources=lax" in text:
+        return False, "از قبل تنظیم شده؛ سرور را ری‌استارت کنید"
+    m = re.search(r'^GRUB_CMDLINE_LINUX_DEFAULT="([^"]*)"', text, re.M)
+    if m:
+        new = text[:m.start(1)] + (m.group(1) + " acpi_enforce_resources=lax").strip() + text[m.end(1):]
+    else:
+        new = text.rstrip("\n") + '\nGRUB_CMDLINE_LINUX_DEFAULT="acpi_enforce_resources=lax"\n'
+    backup = config.GRUB + ".eris-bot-" + time.strftime("%Y%m%d-%H%M%S")
+    write(backup, text + "\n")
+    write(config.GRUB, new)
+    r = system.sh(["update-grub"], timeout=300)
+    if r.returncode != 0:
+        write(config.GRUB, text + "\n")
+        return False, "update-grub نشد؛ فایل برگشت: %s" % (r.stderr or r.stdout)[-300:]
+    return True, "اضافه شد (نسخه‌ی قبلی: %s)؛ بعد از ری‌استارت سرور دوباره «پیدا کردن خودکار» را بزنید" % backup
 ERISBOT_EOF_hw_py
   put_file "$STAGE/erisbot/marzban.py" 0644 << 'ERISBOT_EOF_marzban_py'
 """Marzban 0.8.4 API on this server: https://127.0.0.1:<UVICORN_PORT> as the .env admin.
@@ -3482,6 +3650,7 @@ ERISBOT_EOF_s_backup_py
   put_file "$STAGE/erisbot/s_fans.py" 0644 << 'ERISBOT_EOF_s_fans_py'
 """Fans, performance profiles, finding the CPU fan controller, the BIOS overclocking guide, the stress test."""
 import os
+import threading
 
 from . import fand, hw, perf, stress, system
 from .ui import PRIMARY, SUCCESS, Btn, Screen
@@ -3711,9 +3880,16 @@ def register(app):
                "این کار <code>sensors-detect --auto</code> را اجرا می‌کند؛ روی بعضی بردها پرس‌وجوی سخت‌افزار کمی ریسک دارد.\n"
                "بعد از آن، هر درایور پیشنهادی را جدا و با تأیید لود می‌کنیم.")
         if not os.path.exists(hw.config.SENSORS_DETECT):
-            txt += "\n\n❌ sensors-detect پیدا نشد (<code>apt install lm-sensors</code>)."
-            return Screen(txt, back=("fan", []))
-        return Screen(txt, [[Btn("🔍 اجرای sensors-detect", "fan_detect_go", confirm="sensors-detect --auto اجرا شود؟")]], back=("fan", []))
+            txt += "\n\nℹ️ sensors-detect پیدا نشد (<code>apt install lm-sensors</code>)؛ پیدا کردن خودکار بدون آن هم کار می‌کند."
+            return Screen(txt, [[Btn("🪄 پیدا کردن خودکار و تست فن CPU", "fan_auto", confirm="درایورهای Super I/O یکی‌یکی امتحان شوند؟")]],
+                          back=("fan", []))
+        auto = Btn("🪄 پیدا کردن خودکار و تست فن CPU", "fan_auto",
+                   confirm="ربات درایورهای Super I/O (it87، w83627ehf، nct6775، f71882fg …) را یکی‌یکی امتحان می‌کند؛ "
+                           "هر درایور خودش شناسه‌ی چیپ را چک می‌کند و روی چیپ دیگر لود نمی‌شود.\n"
+                           "بعد هر pwm پیدا شده چند ثانیه روی ۱۰۰٪ و ۳۵٪ می‌رود تا معلوم شود کدام فن را می‌چرخاند، "
+                           "و به حالت قبل برمی‌گردد. (حدود ۱ تا ۲ دقیقه)")
+        return Screen(txt, [[auto], [Btn("🔍 فقط اجرای sensors-detect", "fan_detect_go", confirm="sensors-detect --auto اجرا شود؟")]],
+                      back=("fan", []))
 
     @app.action("fan_detect_go", write=True, steps=1, view=False)
     def detect_go(ctx):
@@ -3749,6 +3925,82 @@ def register(app):
         log("fan driver %s%s loaded and kept by chat %s", driver, " force_id=" + force_id if force_id else "", ctx.chat_id)
         return Screen("✅ %s لود شد و در بوت هم لود می‌شود.\nفن‌های تازه:\n%s" % (
             esc(driver), "\n".join("• " + esc(f["label"]) for f in new)), back=("fan", []))
+
+    @app.action("fan_auto", write=True, steps=1, view=False)
+    def fan_auto(ctx):
+        chat, mid = ctx.chat_id, ctx.msg_id
+        ctx.answer("شروع شد…")
+        if getattr(app, "fan_auto_running", False):
+            return Screen("⏳ پیدا کردن خودکار از قبل در حال اجراست.", back=("fan", []))
+        app.fan_auto_running = True
+        lines = ["🪄 <b>پیدا کردن کنترلر فن CPU</b>"]
+
+        def show(text):
+            try:
+                t, mk = app.render(chat, Screen("\n".join(lines + ["⏳ " + text])))
+                app.bot.edit(chat, mid, t, mk)
+            except Exception:  # a failed edit must not stop the search
+                pass
+
+        def run():
+            try:
+                rep = hw.auto_detect(progress=show)
+                t, mk = app.render(chat, auto_result(rep))
+            except Exception as e:  # noqa: B902 - show it instead of dying in a thread
+                log("fan auto-detect: %r", e)
+                t, mk = app.render(chat, Screen("❌ خطا: %s" % esc(e), back=("fan", [])))
+            finally:
+                app.fan_auto_running = False
+            try:
+                app.bot.edit(chat, mid, t, mk)
+            except Exception:  # noqa: B902
+                app.notify(t, chats=[chat])
+        log("fan auto-detect asked by chat %s", chat)
+        show("شروع…")
+        threading.Thread(target=run, name="fan-auto", daemon=True).start()
+        return None
+
+    def auto_result(rep):
+        lines = ["🪄 <b>نتیجه‌ی پیدا کردن کنترلر فن CPU</b>"] + rep["steps"]
+        rows = []
+        if rep["driver"]:
+            lines.append("")
+            lines.append("✅ درایور <b>%s</b>%s لود شد و از این به بعد در بوت هم لود می‌شود." % (
+                esc(rep["driver"]), " (با %s)" % esc(rep["options"]) if rep["options"] else ""))
+            for f, t in rep["fans"]:
+                if t["ok"]:
+                    lines.append("🌀 %s: کار می‌کند — %s RPM در ۱۰۰٪ و %s RPM در ۳۵٪" % (esc(f["id"]), fa(t["hi"]), fa(t["lo"])))
+                    rows.append([Btn("📈 منحنی معمولی برای %s" % t["input"], "fan_set", f["id"], "curve", "normal", style=SUCCESS),
+                                 Btn("🌀 تنظیم این فن", "fan_one", f["id"], style=PRIMARY)])
+                else:
+                    lines.append("▫️ %s: دور هیچ فنی با آن عوض نشد (یا فنی به آن وصل نیست%s)" % (
+                        esc(f["id"]), "، یا BIOS آن را قفل کرده" if t.get("hi") else ""))
+            if not any(t["ok"] for _, t in rep["fans"]):
+                lines.append("⚠️ pwm هست ولی دور فن عوض نمی‌شود. در BIOS «CPU Fan Control / Smart Fan» را روی Manual یا "
+                             "Disabled بگذارید تا BIOS با لینوکس سر فن دعوا نکند، و اگر فن ۳ سیم است حالت DC/Voltage را انتخاب کنید؛ بعد دوباره امتحان کنید.")
+        else:
+            lines.append("")
+            if rep["conflict"]:
+                lines.append("⚠️ چیپ فن هست ولی BIOS پورت‌هایش را برای ACPI گرفته (resource conflict). "
+                             "راه رایج: پارامتر کرنل <code>acpi_enforce_resources=lax</code> و یک ری‌استارت. "
+                             "این کار رایج و معمولاً بی‌خطر است، ولی یعنی BIOS و درایور هر دو به یک چیپ دست می‌زنند.")
+                rows.append([Btn("🧩 افزودن acpi_enforce_resources=lax به GRUB", "fan_acpi_lax", steps=2,
+                                 confirm="پارامتر <code>acpi_enforce_resources=lax</code> به خط فرمان کرنل (GRUB) اضافه شود؟ "
+                                         "از /etc/default/grub نسخه‌ی پشتیبان گرفته می‌شود و بعد از ری‌استارت اعمال می‌شود.")])
+            elif rep.get("unknown_ids"):
+                lines.append("ℹ️ sensors-detect یک چیپ ناشناخته دید (%s)؛ دکمه‌ی it87 با force_id را از «🔍 فقط اجرای sensors-detect» امتحان کنید."
+                             % "، ".join(rep["unknown_ids"]))
+            else:
+                lines.append("😕 هیچ کنترلر فنی پیدا نشد. یعنی فن CPU این برد از لینوکس قابل کنترل نیست و فقط BIOS "
+                             "(Smart Fan / CPU Fan Control) آن را کنترل می‌کند. منحنی را در BIOS تنظیم کنید.")
+        return Screen("\n".join(lines), rows, back=("fan", []))
+
+    @app.action("fan_acpi_lax", write=True, steps=2, view=False)
+    def fan_acpi_lax(ctx):
+        ok, msg = hw.acpi_lax()
+        log("acpi_enforce_resources=lax by chat %s: %s", ctx.chat_id, msg)
+        rows = [[Btn("🔁 ری‌استارت سرور", "server_reboot", confirm="سرور ری‌استارت شود؟", steps=2)]] if ok else []
+        return Screen(("✅ " if ok else "ℹ️ ") + esc(msg), rows, back=("fan", []))
 
     @app.action("bios")
     def bios(ctx):

@@ -193,6 +193,14 @@ class FanMenuTests(BotCase):
         text, _, _ = self.press("بله")
         self.assertIn("فقط BIOS", text)
 
+    def test_auto_detect_button(self):
+        self.say("/menu")
+        self.press("فن و عملکرد")
+        text, markup, _ = self.press("تشخیص کنترلر")
+        self.assertEqual({t: st for t, _, st in mocks.buttons(markup)}["🪄 پیدا کردن خودکار و تست فن CPU"], "danger")
+        self.press("پیدا کردن خودکار")
+        self.assertIn("Super I/O", self.last_screen()[0])         # asks first
+
     def test_bios_guide(self):
         self.say("/menu")
         self.press("فن و عملکرد")

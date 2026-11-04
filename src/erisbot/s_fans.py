@@ -1,5 +1,6 @@
 """Fans, performance profiles, finding the CPU fan controller, the BIOS overclocking guide, the stress test."""
 import os
+import threading
 
 from . import fand, hw, perf, stress, system
 from .ui import PRIMARY, SUCCESS, Btn, Screen
@@ -229,9 +230,16 @@ def register(app):
                "این کار <code>sensors-detect --auto</code> را اجرا می‌کند؛ روی بعضی بردها پرس‌وجوی سخت‌افزار کمی ریسک دارد.\n"
                "بعد از آن، هر درایور پیشنهادی را جدا و با تأیید لود می‌کنیم.")
         if not os.path.exists(hw.config.SENSORS_DETECT):
-            txt += "\n\n❌ sensors-detect پیدا نشد (<code>apt install lm-sensors</code>)."
-            return Screen(txt, back=("fan", []))
-        return Screen(txt, [[Btn("🔍 اجرای sensors-detect", "fan_detect_go", confirm="sensors-detect --auto اجرا شود؟")]], back=("fan", []))
+            txt += "\n\nℹ️ sensors-detect پیدا نشد (<code>apt install lm-sensors</code>)؛ پیدا کردن خودکار بدون آن هم کار می‌کند."
+            return Screen(txt, [[Btn("🪄 پیدا کردن خودکار و تست فن CPU", "fan_auto", confirm="درایورهای Super I/O یکی‌یکی امتحان شوند؟")]],
+                          back=("fan", []))
+        auto = Btn("🪄 پیدا کردن خودکار و تست فن CPU", "fan_auto",
+                   confirm="ربات درایورهای Super I/O (it87، w83627ehf، nct6775، f71882fg …) را یکی‌یکی امتحان می‌کند؛ "
+                           "هر درایور خودش شناسه‌ی چیپ را چک می‌کند و روی چیپ دیگر لود نمی‌شود.\n"
+                           "بعد هر pwm پیدا شده چند ثانیه روی ۱۰۰٪ و ۳۵٪ می‌رود تا معلوم شود کدام فن را می‌چرخاند، "
+                           "و به حالت قبل برمی‌گردد. (حدود ۱ تا ۲ دقیقه)")
+        return Screen(txt, [[auto], [Btn("🔍 فقط اجرای sensors-detect", "fan_detect_go", confirm="sensors-detect --auto اجرا شود؟")]],
+                      back=("fan", []))
 
     @app.action("fan_detect_go", write=True, steps=1, view=False)
     def detect_go(ctx):
@@ -267,6 +275,82 @@ def register(app):
         log("fan driver %s%s loaded and kept by chat %s", driver, " force_id=" + force_id if force_id else "", ctx.chat_id)
         return Screen("✅ %s لود شد و در بوت هم لود می‌شود.\nفن‌های تازه:\n%s" % (
             esc(driver), "\n".join("• " + esc(f["label"]) for f in new)), back=("fan", []))
+
+    @app.action("fan_auto", write=True, steps=1, view=False)
+    def fan_auto(ctx):
+        chat, mid = ctx.chat_id, ctx.msg_id
+        ctx.answer("شروع شد…")
+        if getattr(app, "fan_auto_running", False):
+            return Screen("⏳ پیدا کردن خودکار از قبل در حال اجراست.", back=("fan", []))
+        app.fan_auto_running = True
+        lines = ["🪄 <b>پیدا کردن کنترلر فن CPU</b>"]
+
+        def show(text):
+            try:
+                t, mk = app.render(chat, Screen("\n".join(lines + ["⏳ " + text])))
+                app.bot.edit(chat, mid, t, mk)
+            except Exception:  # a failed edit must not stop the search
+                pass
+
+        def run():
+            try:
+                rep = hw.auto_detect(progress=show)
+                t, mk = app.render(chat, auto_result(rep))
+            except Exception as e:  # noqa: B902 - show it instead of dying in a thread
+                log("fan auto-detect: %r", e)
+                t, mk = app.render(chat, Screen("❌ خطا: %s" % esc(e), back=("fan", [])))
+            finally:
+                app.fan_auto_running = False
+            try:
+                app.bot.edit(chat, mid, t, mk)
+            except Exception:  # noqa: B902
+                app.notify(t, chats=[chat])
+        log("fan auto-detect asked by chat %s", chat)
+        show("شروع…")
+        threading.Thread(target=run, name="fan-auto", daemon=True).start()
+        return None
+
+    def auto_result(rep):
+        lines = ["🪄 <b>نتیجه‌ی پیدا کردن کنترلر فن CPU</b>"] + rep["steps"]
+        rows = []
+        if rep["driver"]:
+            lines.append("")
+            lines.append("✅ درایور <b>%s</b>%s لود شد و از این به بعد در بوت هم لود می‌شود." % (
+                esc(rep["driver"]), " (با %s)" % esc(rep["options"]) if rep["options"] else ""))
+            for f, t in rep["fans"]:
+                if t["ok"]:
+                    lines.append("🌀 %s: کار می‌کند — %s RPM در ۱۰۰٪ و %s RPM در ۳۵٪" % (esc(f["id"]), fa(t["hi"]), fa(t["lo"])))
+                    rows.append([Btn("📈 منحنی معمولی برای %s" % t["input"], "fan_set", f["id"], "curve", "normal", style=SUCCESS),
+                                 Btn("🌀 تنظیم این فن", "fan_one", f["id"], style=PRIMARY)])
+                else:
+                    lines.append("▫️ %s: دور هیچ فنی با آن عوض نشد (یا فنی به آن وصل نیست%s)" % (
+                        esc(f["id"]), "، یا BIOS آن را قفل کرده" if t.get("hi") else ""))
+            if not any(t["ok"] for _, t in rep["fans"]):
+                lines.append("⚠️ pwm هست ولی دور فن عوض نمی‌شود. در BIOS «CPU Fan Control / Smart Fan» را روی Manual یا "
+                             "Disabled بگذارید تا BIOS با لینوکس سر فن دعوا نکند، و اگر فن ۳ سیم است حالت DC/Voltage را انتخاب کنید؛ بعد دوباره امتحان کنید.")
+        else:
+            lines.append("")
+            if rep["conflict"]:
+                lines.append("⚠️ چیپ فن هست ولی BIOS پورت‌هایش را برای ACPI گرفته (resource conflict). "
+                             "راه رایج: پارامتر کرنل <code>acpi_enforce_resources=lax</code> و یک ری‌استارت. "
+                             "این کار رایج و معمولاً بی‌خطر است، ولی یعنی BIOS و درایور هر دو به یک چیپ دست می‌زنند.")
+                rows.append([Btn("🧩 افزودن acpi_enforce_resources=lax به GRUB", "fan_acpi_lax", steps=2,
+                                 confirm="پارامتر <code>acpi_enforce_resources=lax</code> به خط فرمان کرنل (GRUB) اضافه شود؟ "
+                                         "از /etc/default/grub نسخه‌ی پشتیبان گرفته می‌شود و بعد از ری‌استارت اعمال می‌شود.")])
+            elif rep.get("unknown_ids"):
+                lines.append("ℹ️ sensors-detect یک چیپ ناشناخته دید (%s)؛ دکمه‌ی it87 با force_id را از «🔍 فقط اجرای sensors-detect» امتحان کنید."
+                             % "، ".join(rep["unknown_ids"]))
+            else:
+                lines.append("😕 هیچ کنترلر فنی پیدا نشد. یعنی فن CPU این برد از لینوکس قابل کنترل نیست و فقط BIOS "
+                             "(Smart Fan / CPU Fan Control) آن را کنترل می‌کند. منحنی را در BIOS تنظیم کنید.")
+        return Screen("\n".join(lines), rows, back=("fan", []))
+
+    @app.action("fan_acpi_lax", write=True, steps=2, view=False)
+    def fan_acpi_lax(ctx):
+        ok, msg = hw.acpi_lax()
+        log("acpi_enforce_resources=lax by chat %s: %s", ctx.chat_id, msg)
+        rows = [[Btn("🔁 ری‌استارت سرور", "server_reboot", confirm="سرور ری‌استارت شود؟", steps=2)]] if ok else []
+        return Screen(("✅ " if ok else "ℹ️ ") + esc(msg), rows, back=("fan", []))
 
     @app.action("bios")
     def bios(ctx):

@@ -284,3 +284,77 @@ it87
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AutoDetect(unittest.TestCase):
+    """A G41 board whose it87 chip is claimed by ACPI: plain modprobe gives nothing, the option does."""
+
+    def setUp(self):
+        base.reset_tree()
+        self.calls = []
+        self.dmesg = ""
+        self.orig = system.sh
+
+        def fake(cmd, timeout=30, input=None):
+            self.calls.append(" ".join(cmd))
+            ok = system.subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd[0] == "dmesg":
+                return system.subprocess.CompletedProcess(cmd, 0, self.dmesg, "")
+            if cmd[:2] == ["modprobe", "it87"] and len(cmd) == 2:
+                self.dmesg += "it87: Found IT8718F chip at 0x290, revision 5\nACPI Warning: SystemIO range 0x295 conflicts with OpRegion (it87)\nit87: resource conflict, acpi_enforce_resources=lax\n"
+                return system.subprocess.CompletedProcess(cmd, 1, "", "modprobe: ERROR: could not insert 'it87': Device or resource busy")
+            if cmd == ["modprobe", "it87", "ignore_resource_conflict=1"]:
+                d = HW + "/hwmon5"
+                for f, v in (("name", "it87"), ("pwm1", 255), ("pwm1_enable", 2), ("fan1_input", 2400),
+                             ("pwm2", 255), ("pwm2_enable", 2), ("fan2_input", 0)):
+                    base.put(d + "/" + f, "%s\n" % v)
+                return ok
+            if cmd[0] == "modprobe":
+                return system.subprocess.CompletedProcess(cmd, 1, "", "No such device")
+            return ok
+        system.sh = fake
+
+    def tearDown(self):
+        system.sh = self.orig
+
+    def fan_follows_pwm(self, _):
+        pwm = int(rd(HW + "/hwmon5/pwm1"))
+        base.put(HW + "/hwmon5/fan1_input", "%d\n" % (600 + pwm * 7))
+
+    def test_finds_tests_and_keeps_it87(self):
+        rep = hw.auto_detect(settle=0, sleep=self.fan_follows_pwm)
+        self.assertEqual(rep["driver"], "it87")
+        self.assertEqual(rep["options"], "ignore_resource_conflict=1")
+        self.assertTrue(rep["conflict"])
+        res = {f["id"]: t for f, t in rep["fans"]}
+        self.assertTrue(res["it87@hwmon5/pwm1"]["ok"])
+        self.assertEqual(res["it87@hwmon5/pwm1"]["input"], "fan1")
+        self.assertFalse(res["it87@hwmon5/pwm2"]["ok"])           # nothing turns on pwm2
+        self.assertEqual(rd(HW + "/hwmon5/pwm1_enable"), "2")     # given back after the test
+        self.assertEqual(rd(HW + "/hwmon5/pwm1"), "255")
+        self.assertIn("it87", rd(config.MODULES_LOAD))
+        self.assertIn("options it87 ignore_resource_conflict=1", rd(config.MODPROBE_D))
+        label = {f["id"]: f["label"] for f in hw.fans()}["it87@hwmon5/pwm1"]
+        self.assertIn("fan1", label)
+        self.assertFalse(any("force_id" in c for c in self.calls))   # never forced
+
+    def test_nothing_found_is_said_honestly(self):
+        system_sh = system.sh
+
+        def none(cmd, timeout=30, input=None):
+            if cmd[0] == "modprobe" and "-r" not in cmd:
+                return system.subprocess.CompletedProcess(cmd, 1, "", "No such device")
+            return system_sh(cmd, timeout, input)
+        system.sh = none
+        rep = hw.auto_detect(settle=0, sleep=lambda s: None)
+        self.assertIsNone(rep["driver"])
+        self.assertFalse(rep["conflict"])
+        self.assertEqual(len(rep["steps"]), len(hw.TRY_ORDER))
+
+    def test_grub_lax(self):
+        base.put(config.GRUB, 'GRUB_DEFAULT=0\nGRUB_CMDLINE_LINUX_DEFAULT="quiet"\n')
+        ok, msg = hw.acpi_lax()
+        self.assertTrue(ok, msg)
+        self.assertIn('GRUB_CMDLINE_LINUX_DEFAULT="quiet acpi_enforce_resources=lax"', rd(config.GRUB))
+        self.assertIn("update-grub", self.calls)
+        self.assertFalse(hw.acpi_lax()[0])                        # only once
