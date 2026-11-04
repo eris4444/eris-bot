@@ -261,6 +261,8 @@ class App:
             action, args = entry
             if action == "noop":
                 return ctx.answer()
+            if action != "_ask":
+                self.session(chat_id)["input"] = None     # a button ends any "send me a ..." question
             res = self.run(ctx, action, args)
             ctx.answer(res.notice if isinstance(res, Screen) else None)
             return res
