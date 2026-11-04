@@ -3,7 +3,7 @@ import os
 import re
 import time
 
-from . import config, eris, fand, marzban, net, system, tg
+from . import alerts, config, eris, fand, marzban, net, system, tg
 from .ui import DANGER, PRIMARY, SUCCESS, Btn, Screen
 from .util import ago, bar, duration, esc, fa, human, log
 
@@ -96,7 +96,9 @@ def menu_screen(app, ctx):
     if eris.available():
         btns.append(Btn("🛡 فایروال", "fw", style=PRIMARY))
         btns.append(Btn("💾 بکاپ", "bk", style=PRIMARY))
-    btns += [Btn("🔔 هشدارها", "al", style=PRIMARY), Btn("🌀 فن و عملکرد", "fan", style=PRIMARY),
+    btns += [Btn("🤖 هوش مصنوعی", "ai", style=PRIMARY), Btn("📁 فایل‌های NAS", "nas", style=PRIMARY),
+             Btn("🌤 آب و هوا", "wx", style=PRIMARY),
+             Btn("🔔 هشدارها", "al", style=PRIMARY), Btn("🌀 فن و عملکرد", "fan", style=PRIMARY),
              Btn("🔁 سرور", "server", style=PRIMARY), Btn("⚙️ تنظیمات", "set", style=PRIMARY)]
     rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
     return Screen("\n".join(lines), rows, refresh=("menu", []))
@@ -200,11 +202,12 @@ def register(app):
                  "🔑 رمز بکاپ: %s" % ("تنظیم شده ✅" if os.path.isfile(pw) and os.path.getsize(pw) > 0 else "❌ تنظیم نشده"),
                  "🗓 گزارش روزانه: %s" % (("ساعت " + dr.get("at", "09:00")) if dr.get("enabled") else "خاموش"),
                  "🎨 رنگ دکمه‌ها: %s" % colors,
-                 "🧩 اندازه‌ی هر تکه‌ی ارسال: %s MB" % fa(c.get("part_size_mb", 45))]
+                 "🧩 اندازه‌ی هر تکه‌ی ارسال: %s MB" % fa(c.get("part_size_mb", 45)),
+                 "📍 IP ثابت: %s" % (("<code>%s</code>" % esc(alerts.static_ip(c))) if alerts.static_ip(c) else "تنظیم نشده")]
         rows = [[Btn("🌐 پروکسی", "set_proxy", style=PRIMARY), Btn("👥 chat IDها", "set_chats", style=PRIMARY)],
                 [Btn("💾 ارسال بکاپ", "set_send", style=PRIMARY), Btn("🔑 رمز بکاپ", "set_pw", style=PRIMARY)],
                 [Btn("🗓 گزارش روزانه", "set_report", style=PRIMARY), Btn("🎨 رنگ دکمه‌ها", "set_colors", style=PRIMARY)],
-                [Btn("🧩 اندازه‌ی تکه", "set_piece", style=PRIMARY)]]
+                [Btn("🧩 اندازه‌ی تکه", "set_piece", style=PRIMARY), Btn("📍 IP عمومی", "set_ip", style=PRIMARY)]]
         return Screen("\n".join(lines), rows, refresh=("set", []), back=("menu", []))
 
     @app.action("set_proxy")
@@ -433,6 +436,54 @@ def register(app):
             if v == "auto":
                 app.state.set("styles_refused", False)
         return set_colors(ctx)
+
+    # -------------------------------------------------------- public IP (static, the alert)
+    @app.action("set_ip")
+    def set_ip(ctx, check=False, notice=None):
+        c = app.conf
+        st = alerts.static_ip(c)
+        lines = ["📍 <b>IP عمومی</b>",
+                 "IP از چند سرویس پرسیده می‌شود و فقط وقتی حساب است که دست‌کم دو تا یکی بگویند؛ تغییر هم فقط "
+                 "بعد از دو بار پشت هم اعلام می‌شود (جواب‌های پرت حساب نمی‌شوند).",
+                 "IP ثابت: %s" % ("<code>%s</code> — هشدار فقط وقتی IP چیز دیگری باشد" % esc(st) if st else "تنظیم نشده")]
+        found = None
+        if check:
+            found, answers = alerts.consensus_ip(alerts.public_ip_urls(c))
+            lines += ["", "🧪 <b>همین الان</b>"]
+            for u, ip in answers:
+                lines.append("• %s: %s" % (esc(u.split("//", 1)[-1].split("/", 1)[0]), "<code>%s</code>" % esc(ip) if ip else "❌"))
+            lines.append("نتیجه: %s" % ("<code>%s</code>" % esc(found) if found else "توافقی نشد"))
+        rows = [[Btn("🧪 بررسی الان", "set_ip", True, style=PRIMARY)]]
+        if found and found != st:
+            rows.append([Btn("📌 %s را IP ثابت کن" % found, "ip_static", found, style=SUCCESS)])
+        rows.append([Btn("✏️ نوشتن IP ثابت", "ip_static_ask", style=PRIMARY)] +
+                    ([Btn("❌ بدون IP ثابت", "ip_static", "", style=PRIMARY)] if st else []))
+        s = Screen("\n".join(lines), rows, back=("set", []))
+        s.notice = notice
+        return s
+
+    @app.action("ip_static", write=True, view=False)
+    def ip_static(ctx, ip):
+        pi = dict(app.conf.get("public_ip") or {})
+        pi["static"] = ip
+        app.save_conf(public_ip=pi)
+        app.sources.st.update(ip_candidate=None, ip_streak=0)
+        log("static IP set to %r by chat %s", ip, ctx.chat_id)
+        return set_ip(ctx, False, "✅ IP ثابت: %s" % ip if ip else "IP ثابت برداشته شد")
+
+    @app.action("ip_static_ask", write=True, view=False)
+    def ip_static_ask(ctx):
+        return ctx.ask_text("ip_static", "✏️ IP ثابت سرور را بفرستید (مثلاً <code>203.0.113.7</code>):", back=("set_ip", []))
+
+    @app.text_input("ip_static")
+    def ip_static_input(ctx, text, msg):
+        import ipaddress
+        try:
+            ip = str(ipaddress.ip_address(text.strip()))
+        except ValueError:
+            return Screen("❌ IP نامعتبر است.", back=("set_ip", []))
+        ctx.msg_id = None
+        return ip_static(ctx, ip)
 
     @app.action("set_piece")
     def set_piece(ctx):

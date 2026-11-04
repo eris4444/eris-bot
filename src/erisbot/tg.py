@@ -43,6 +43,21 @@ def strip_styles(obj):
     return out, found[0]
 
 
+def style_refusal(desc):
+    """Could this 400 be Telegram refusing the buttons' "style" field? Never for an edit that changes
+    nothing ("message is not modified", e.g. a button pressed twice): sending the same screen without
+    colours would "work" and wrongly turn colours off for good."""
+    d = (desc or "").lower()
+    if "not modified" in d or "message to edit not found" in d or "query is too old" in d:
+        return False
+    return "button" in d or "style" in d or "keyboard" in d or "reply markup" in d or "reply_markup" in d
+
+
+def stale_refusal(reason):
+    """A colour refusal saved by an older version that was really an unchanged edit."""
+    return not style_refusal(reason)
+
+
 class Router:
     """The way to Telegram. proxy = off | auto | URL; auto tries direct first, then proxy_list in order."""
 
@@ -221,7 +236,7 @@ class Bot:
                 self.sleep(min(10, delay))
                 delay *= 2
                 continue
-            if code == 400 and "reply_markup" in params:
+            if code == 400 and "reply_markup" in params and style_refusal(desc):
                 plain, had = strip_styles(params["reply_markup"])
                 if had:
                     try:
@@ -317,6 +332,51 @@ class Bot:
                 continue
             raise TelegramError(code, res.get("description", ""))
         raise TelegramError(429, "too many requests")
+
+    # ------------------------------------------------------------ downloads (a file someone sent)
+    def download(self, file_id, dest, limit=20 * 1024 * 1024, progress=None):
+        """Save a file sent to the bot (getFile + /file/bot<token>/<path>) to `dest`; returns its size.
+        The Bot API serves files up to 20 MB."""
+        info = self.call("getFile", {"file_id": file_id}, timeout=30)
+        path = (info or {}).get("file_path")
+        if not path:
+            raise TelegramError(400, "Telegram gave no file path (files over 20 MB cannot be downloaded by bots)")
+        size = int((info or {}).get("file_size") or 0)
+        if size and size > limit:
+            raise TelegramError(400, "file too big")
+        last = None
+        for _ in range(4):
+            route = self.route()
+            c = net.Connection(self.base(), route, 15.0)
+            try:
+                c.request("GET", "%s/file/bot%s/%s" % (self._path_prefix(), self.conf["token"], path))
+                c.sock.settimeout(120)
+                r = c.getresponse()
+                if r.status != 200:
+                    raise TelegramError(r.status, "download failed (HTTP %d)" % r.status)
+                done = 0
+                tmp = dest + ".part"
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = r.read(65536)
+                        if not chunk:
+                            break
+                        done += len(chunk)
+                        if done > limit:
+                            raise TelegramError(400, "file too big")
+                        f.write(chunk)
+                        if progress:
+                            progress(done, size)
+                os.replace(tmp, dest)
+                return done
+            except NET_ERRORS as e:
+                last = e
+                self.router.failed(route)
+            finally:
+                c.close()
+                if os.path.exists(dest + ".part"):
+                    os.remove(dest + ".part")
+        raise last or OSError("download failed")
 
     # ------------------------------------------------------------ helpers
     def get_me(self):

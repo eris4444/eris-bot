@@ -54,6 +54,8 @@ class MockTelegram:
         self.next_msg = 100
         self.sent = []          # (method, params)
         self.messages = {}      # (chat, id) -> text
+        self.markups = {}       # (chat, id) -> reply_markup JSON
+        self.files = {}         # file_id -> bytes (getFile / file download)
         self.documents = []     # (chat, filename, bytes, caption)
         self.photos = []
         self.answers = []
@@ -75,6 +77,14 @@ class MockTelegram:
             def do_POST(self):
                 path = urllib.parse.urlsplit(self.path).path
                 parts = path.strip("/").split("/")
+                if len(parts) >= 3 and parts[0] == "file" and parts[1] == "bot" + mock.token:
+                    data = mock.files.get("/".join(parts[2:]))
+                    if data is None:
+                        return self.reply(404, {"ok": False, "error_code": 404, "description": "Not Found"})
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    return self.wfile.write(data)
                 if len(parts) < 2 or parts[-2] != "bot" + mock.token:
                     return self.reply(404, {"ok": False, "error_code": 404, "description": "Not Found"})
                 method = parts[-1]
@@ -154,6 +164,7 @@ class MockTelegram:
                 chat = int(p["chat_id"])
                 if method == "sendMessage":
                     self.messages[(chat, mid)] = p["text"]
+                    self.markups[(chat, mid)] = json.dumps(p.get("reply_markup"), sort_keys=True)
                     return {"message_id": mid, "chat": {"id": chat}, "text": p["text"]}
                 if method == "sendDocument":
                     if "document" in files:
@@ -175,9 +186,13 @@ class MockTelegram:
             with self.lock:
                 if key not in self.messages:
                     return 400, {"ok": False, "error_code": 400, "description": "Bad Request: message to edit not found"}
-                if self.messages[key] == p["text"] and not p.get("reply_markup"):
-                    return 400, {"ok": False, "error_code": 400, "description": "Bad Request: message is not modified"}
+                markup = json.dumps(p.get("reply_markup"), sort_keys=True)
+                if self.messages[key] == p["text"] and self.markups.get(key) == markup:
+                    return 400, {"ok": False, "error_code": 400, "description":
+                                 "Bad Request: message is not modified: specified new message content and reply "
+                                 "markup are exactly the same as a current content and reply markup of the message"}
                 self.messages[key] = p["text"]
+                self.markups[key] = markup
             return {"message_id": key[1], "chat": {"id": key[0]}, "text": p["text"]}
         if method == "answerCallbackQuery":
             with self.lock:
@@ -189,6 +204,13 @@ class MockTelegram:
                 self.messages.pop((int(p["chat_id"]), int(p["message_id"])), None)
             return True
         if method == "setMyCommands":
+            return True
+        if method == "getFile":
+            fid = p["file_id"]
+            if fid not in self.files:
+                return 400, {"ok": False, "error_code": 400, "description": "Bad Request: invalid file_id"}
+            return {"file_id": fid, "file_size": len(self.files[fid]), "file_path": fid}
+        if method == "sendChatAction":
             return True
         raise KeyError("unknown method %s" % method)
 
@@ -205,6 +227,22 @@ class MockTelegram:
         self.next_msg += 1
         return self.push({"message": {"message_id": mid or self.next_msg, "chat": {"id": chat, "type": "private"},
                                       "from": {"id": user or chat, "first_name": "T"}, "text": text}})
+
+    def document(self, chat, name, data, caption=None):
+        """The user sends a file to the bot."""
+        self.next_msg += 1
+        fid = "DOC%d" % self.next_msg
+        self.files[fid] = data
+        m = {"message_id": self.next_msg, "chat": {"id": chat, "type": "private"}, "from": {"id": chat},
+             "document": {"file_id": fid, "file_name": name, "file_size": len(data)}}
+        if caption:
+            m["caption"] = caption
+        return self.push({"message": m})
+
+    def location(self, chat, lat, lon):
+        self.next_msg += 1
+        return self.push({"message": {"message_id": self.next_msg, "chat": {"id": chat, "type": "private"},
+                                      "from": {"id": chat}, "location": {"latitude": lat, "longitude": lon}}})
 
     def press(self, chat, msg_id, data):
         return self.push({"callback_query": {"id": "cq%d" % self.next_update, "from": {"id": chat},

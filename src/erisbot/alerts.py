@@ -260,18 +260,36 @@ class Sources:
         return self.cache_set("cert", cond), []
 
     def c_ip(self, now):
+        """The public IP from several services: one answer counts only when at least two services agree
+        (one odd answer — a provider's other exit — is ignored), and a change only after two rounds in a
+        row. With a static IP set, an alert stays on while the agreed IP is another one."""
         if not self.due("ip", 600, now):
-            return {}, []
-        ip = public_ip(self.app.conf.get("public_ip_urls") or [])
+            return self.cache_get("ip"), []
+        ip, _ = consensus_ip(public_ip_urls(self.app.conf))
         if not ip:
-            return {}, []
+            return self.cache_get("ip"), []           # no agreement this round: change nothing
+        static = static_ip(self.app.conf)
+        if ip == (static or self.st.get("public_ip")):
+            self.st.update(ip_candidate=None, ip_streak=0)
+            if not static:
+                return {}, []
+            return self.cache_set("ip", {}), []
+        streak = (self.st.get("ip_streak") or 0) + 1 if self.st.get("ip_candidate") == ip else 1
+        self.st.update(ip_candidate=ip, ip_streak=streak)
+        if static:
+            if streak < CONFIRM_ROUNDS:
+                return self.cache_get("ip"), []
+            return self.cache_set("ip", {"ip_static": (
+                "ip", 2, "🌐 IP عمومی سرور <code>%s</code> است، نه IP ثابت <code>%s</code>" % (esc(ip), esc(static)),
+                "✅ IP عمومی دوباره <code>%s</code> است" % esc(static))}), []
         old = self.st.get("public_ip")
-        events = []
-        if old and old != ip:
-            events.append(("ip", "ip:%s" % ip, 1, "🌐 IP عمومی عوض شد: از <code>%s</code> به <code>%s</code>" % (esc(old), esc(ip))))
-        if ip != old:
-            self.st.set("public_ip", ip)
-        return {}, events
+        if not old:
+            self.st.update(public_ip=ip, ip_candidate=None, ip_streak=0)
+            return {}, []
+        if streak < CONFIRM_ROUNDS:
+            return {}, []
+        self.st.update(public_ip=ip, ip_candidate=None, ip_streak=0)
+        return {}, [("ip", "ip:%s" % ip, 1, "🌐 IP عمومی عوض شد: از <code>%s</code> به <code>%s</code>" % (esc(old), esc(ip)))]
 
     def c_backup(self, now):
         cond = {}
@@ -320,13 +338,48 @@ def cert_end(pem):
         return None
 
 
+CONFIRM_ROUNDS = 2
+DEAD_IP_URLS = ("https://ifconfig.me/ip",)        # answers 403 to scripts now
+
+
+def public_ip_urls(conf):
+    urls = [u for u in conf.get("public_ip_urls") or [] if u not in DEAD_IP_URLS]
+    return urls or list(config.DEFAULTS["public_ip_urls"])
+
+
+def static_ip(conf):
+    s = str((conf.get("public_ip") or {}).get("static") or "").strip()
+    try:
+        return str(ipaddress.ip_address(s)) if s else ""
+    except ValueError:
+        return ""
+
+
+def ask_ip(url):
+    """One service's answer (an IP string) or None; direct, never through a proxy."""
+    try:
+        r = net.request("GET", url, proxy=None, timeout=8, read_timeout=8)
+        if r.status != 200:
+            return None
+        ip = r.body.decode("ascii", "replace").strip()
+        return str(ipaddress.ip_address(ip))
+    except (OSError, ValueError, Exception):  # noqa: B014 - any failure: this service gave no answer
+        return None
+
+
+def consensus_ip(urls, ask=ask_ip):
+    """(the IP at least two services agree on — or the only one when one service is set up — or None,
+    [(url, answer)])."""
+    answers = [(u, ask(u)) for u in urls]
+    counts = {}
+    for _, ip in answers:
+        if ip:
+            counts[ip] = counts.get(ip, 0) + 1
+    need = 1 if len(urls) == 1 else 2
+    best = max(counts.items(), key=lambda kv: kv[1], default=(None, 0))
+    return (best[0] if best[1] >= need else None), answers
+
+
 def public_ip(urls):
-    for u in urls:
-        try:
-            r = net.request("GET", u, proxy=None, timeout=10, read_timeout=10)
-            ip = r.body.decode("ascii", "replace").strip()
-            ipaddress.ip_address(ip)
-            return ip
-        except (OSError, ValueError, Exception):  # noqa: B014 - any failure: try the next service
-            continue
-    return None
+    """The agreed public IP (kept for callers of older versions)."""
+    return consensus_ip(urls)[0]

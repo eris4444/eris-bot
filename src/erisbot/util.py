@@ -54,6 +54,49 @@ def fa(x):
     return str(x).translate(_FA)
 
 
+_EN = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩٫،", "01234567890123456789.,")
+_NUM_RX = re.compile(r"^([+-]?)\s*(\d+(?:[.,]\d+)?|[.,]\d+)\s*(.*)$")
+UNLIMITED_WORDS = ("نامحدود", "بی‌نهایت", "بینهایت", "بی نهایت", "inf", "unlimited", "∞", "♾")
+
+
+def fmt_num(x):
+    """12 -> ۱۲, 1.5 -> ۱.۵ (no trailing .0)."""
+    x = float(x)
+    s = ("%d" % x) if x == int(x) else ("%.2f" % x).rstrip("0").rstrip(".")
+    return fa(s)
+
+
+def parse_amount(text, kind, allow_negative=False):
+    """A number the user typed, with an optional unit. kind "gb": GB (or MB/TB units); kind "days": days
+    (or hour/week/month/year units). Persian/Arabic digits and the Persian decimal point work.
+    Returns a float (0 = unlimited) or None when it cannot be read."""
+    t = (text or "").strip().translate(_EN).lower().replace("‌", " ")
+    if any(w.replace("‌", " ") == t for w in UNLIMITED_WORDS):
+        return 0.0
+    m = _NUM_RX.match(t)
+    if not m:
+        return None
+    sign, num, unit = m.group(1), m.group(2).replace(",", "."), m.group(3).strip()
+    value = float(num)
+    if kind == "gb":
+        units = {"": 1, "g": 1, "gb": 1, "گیگ": 1, "گیگابایت": 1, "گ": 1,
+                 "m": 1 / 1024.0, "mb": 1 / 1024.0, "مگ": 1 / 1024.0, "مگابایت": 1 / 1024.0,
+                 "t": 1024, "tb": 1024, "ترا": 1024, "ترابایت": 1024}
+    else:
+        units = {"": 1, "d": 1, "day": 1, "days": 1, "روز": 1, "h": 1 / 24.0, "hour": 1 / 24.0, "ساعت": 1 / 24.0,
+                 "w": 7, "week": 7, "هفته": 7, "month": 30, "ماه": 30, "y": 365, "year": 365, "سال": 365}
+    if unit not in units:
+        return None
+    value *= units[unit]
+    if sign == "-":
+        if not allow_negative:
+            return None
+        value = -value
+    if abs(value) > (1024 * 1024 if kind == "gb" else 36500):
+        return None
+    return value
+
+
 def esc(s):
     return html.escape(str(s if s is not None else ""), quote=False)
 

@@ -112,19 +112,46 @@ class SourceTests(BotCase):
         cond, _ = self.app.sources.c_certs(time.time())
         self.assertEqual(list(cond), ["cert:soon.example.com"])
 
-    def test_public_ip_change(self):
-        ips = iter(["192.0.2.10", "192.0.2.10", "198.51.100.20"])
-        orig = alerts.public_ip
-        alerts.public_ip = lambda urls: next(ips)
+    def ip_rounds(self, ips):
+        """c_ip() once per agreed IP (None = the services did not agree); the events of each round."""
+        seq = iter(ips)
+        orig = alerts.consensus_ip
+        alerts.consensus_ip = lambda urls, ask=None: (next(seq), [])
         try:
-            for i in range(2):
+            out = []
+            for i in range(len(ips)):
                 self.app.sources.next.clear()
-                self.assertEqual(self.app.sources.c_ip(T0 + i)[1], [])
-            self.app.sources.next.clear()
-            ev = self.app.sources.c_ip(T0 + 5)[1]
-            self.assertIn("198.51.100.20", ev[0][3])
+                out.append(self.app.sources.c_ip(T0 + i))
+            return out
         finally:
-            alerts.public_ip = orig
+            alerts.consensus_ip = orig
+
+    def test_public_ip_change_needs_two_rounds(self):
+        r = self.ip_rounds(["192.0.2.10", "192.0.2.10", "198.51.100.20", "198.51.100.20"])
+        self.assertEqual([e for _, e in r[:3]], [[], [], []])           # one odd answer is not a change
+        self.assertIn("198.51.100.20", r[3][1][0][3])
+
+    def test_public_ip_flapping_is_quiet(self):
+        r = self.ip_rounds(["192.0.2.10", "198.51.100.20", "192.0.2.10", "198.51.100.21", None, "192.0.2.10"])
+        self.assertEqual([e for _, e in r], [[]] * 6)
+
+    def test_public_ip_static(self):
+        self.app.save_conf(public_ip={"static": "192.0.2.10"})
+        r = self.ip_rounds(["192.0.2.10", "198.51.100.20", "198.51.100.20", "198.51.100.20", "192.0.2.10"])
+        self.assertEqual(r[0], ({}, []))
+        self.assertEqual(r[1][0], {})                                    # first odd round: nothing yet
+        self.assertIn("ip_static", r[2][0])
+        self.assertIn("198.51.100.20", r[2][0]["ip_static"][2])
+        self.assertIn("ip_static", r[3][0])
+        self.assertEqual(r[4][0], {})                                    # back to the static IP: resolved
+
+    def test_consensus(self):
+        answers = {"a": "192.0.2.1", "b": "192.0.2.1", "c": "203.0.113.9"}
+        self.assertEqual(alerts.consensus_ip(list(answers), ask=answers.get)[0], "192.0.2.1")
+        split = {"a": "192.0.2.1", "b": "203.0.113.9", "c": None}
+        self.assertIsNone(alerts.consensus_ip(list(split), ask=split.get)[0])
+        self.assertEqual(alerts.consensus_ip(["a"], ask=answers.get)[0], "192.0.2.1")
+        self.assertNotIn("https://ifconfig.me/ip", alerts.public_ip_urls({"public_ip_urls": ["https://ifconfig.me/ip", "x"]}))
 
     def test_part_backup_failed(self):
         with open(os.path.join(os.environ["FAKE_ERIS_DIR"], "failed.json"), "w") as f:

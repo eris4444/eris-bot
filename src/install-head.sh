@@ -7,7 +7,7 @@
 #   bash install-eris-bot.sh --no-selftest  skip the checks at the end
 # After the first install: eris-bot setup
 set -euo pipefail
-VERSION=1.1.0
+VERSION=1.2.0
 LOG=/var/log/eris-bot-install.log
 TS=$(date +%Y%m%d-%H%M%S)
 BK=/var/backups/eris-bot/$TS

@@ -7,7 +7,7 @@
 #   bash install-eris-bot.sh --no-selftest  skip the checks at the end
 # After the first install: eris-bot setup
 set -euo pipefail
-VERSION=1.1.0
+VERSION=1.2.0
 LOG=/var/log/eris-bot-install.log
 TS=$(date +%Y%m%d-%H%M%S)
 BK=/var/backups/eris-bot/$TS
@@ -74,9 +74,460 @@ write_files() {
 
 Python 3 standard library only.
 """
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 REPO = "eris4444/eris-bot"
 ERISBOT_EOF___init___py
+  put_file "$STAGE/erisbot/ai.py" 0644 << 'ERISBOT_EOF_ai_py'
+"""Claude Code and Codex from the bot: plan usage (5-hour / weekly windows), their models and efforts,
+and chats (one CLI run per message, continued with --resume / exec resume).
+
+The chats run with no tools (Claude: --tools "") and a read-only sandbox (Codex), in an empty folder:
+they answer, they do not touch the server. Tokens are read, never refreshed and never logged.
+"""
+import base64
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import threading
+import time
+import urllib.parse
+
+from . import config, net
+from .util import log
+
+CLAUDE_DIR = os.environ.get("ERISBOT_CLAUDE_DIR", config.R("/root/.claude"))
+CODEX_HOME = os.environ.get("ERISBOT_CODEX_HOME", config.R("/root/.codex"))
+AI_ENV = os.environ.get("ERISBOT_AI_ENV", "/usr/local/lib/eris-ai-env.sh")
+AI_PROXY_FILE = os.environ.get("ERISBOT_AI_PROXY", config.R("/etc/eris/ai-proxy"))
+WORKDIR = os.path.join(config.STATE, "ai-work")
+USAGE_URL = os.environ.get("ERISBOT_CLAUDE_USAGE_URL", "https://api.anthropic.com/api/oauth/usage")
+EXTRA_PATH = ["/root/.local/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+
+CLAUDE_NAMES = {"opus": "Opus", "sonnet": "Sonnet", "haiku": "Haiku"}
+CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+EFFORT_FA = {"low": "کم", "medium": "متوسط", "high": "زیاد", "xhigh": "خیلی زیاد", "max": "حداکثر",
+             "ultra": "اولترا", "minimal": "حداقل", "none": "بدون فکر"}
+CLAUDE_WINDOWS = (("five_hour", "۵ ساعته"), ("seven_day", "هفتگی"), ("seven_day_opus", "هفتگی Opus"),
+                  ("seven_day_sonnet", "هفتگی Sonnet"))
+
+
+class AIError(Exception):
+    pass
+
+
+def which(name):
+    env = os.environ.get("ERISBOT_" + name.upper())
+    if env:
+        return env
+    return shutil.which(name, path=os.pathsep.join([os.environ.get("PATH", "")] + EXTRA_PATH))
+
+
+def epoch(v):
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v) / (1000.0 if v > 1e11 else 1.0)
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def read_json(path, limit=4 * 1024 * 1024):
+    with open(path, "rb") as f:
+        raw = f.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError("too large")
+    return json.loads(raw.decode("utf-8"))
+
+
+def ai_proxy():
+    """The AI proxy (http://...) from /etc/eris/ai-proxy when set, else None (direct)."""
+    try:
+        with open(AI_PROXY_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    return None if line.lower() == "none" else (line if "://" in line else "http://" + line)
+    except OSError:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------- usage
+
+class Usage:
+    """Claude: GET /api/oauth/usage with Claude Code's own token (at most every 5 minutes, longer after
+    429). Codex: the newest rate_limits snapshot in its session logs (no network)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.claude = None
+        self.claude_at = 0.0
+        self.claude_next = 0.0
+        self.backoff = 0
+        self.codex = None
+        self.codex_at = 0.0
+
+    def get(self, force=False):
+        with self.lock:
+            now = time.time()
+            if force and now - self.claude_at > 60:
+                self.claude_next = 0
+            if now >= self.claude_next:
+                try:
+                    self.claude = self._claude()
+                except Exception as e:  # noqa: BLE001 - keep the last numbers, say what failed
+                    self.claude = dict(self.claude or {"windows": []}, error="%s" % type(e).__name__)
+                self.claude_at = now
+                self.claude_next = now + (300 if not self.backoff else 600 * self.backoff)
+            if self.codex is None or force or now - self.codex_at > 60:
+                try:
+                    self.codex = self._codex()
+                except Exception as e:  # noqa: BLE001
+                    self.codex = {"windows": [], "error": type(e).__name__}
+                self.codex_at = now
+            return {"claude": dict(self.claude or {}), "codex": dict(self.codex or {})}
+
+    def _claude(self):
+        try:
+            data = read_json(os.path.join(CLAUDE_DIR, ".credentials.json"))
+        except (OSError, ValueError):
+            return {"login": False, "windows": []}
+        creds = (data or {}).get("claudeAiOauth") or {}
+        token = creds.get("accessToken")
+        if not token:
+            return {"login": False, "windows": []}
+        sub = creds.get("subscriptionType")
+        plan = sub.replace("_", " ").title() if isinstance(sub, str) and sub else None
+        m = re.search(r"max_(\d+)x", str(creds.get("rateLimitTier") or ""))
+        if m and plan and "Max" in plan:
+            plan = "Max %sx" % m.group(1)
+        r = net.request("GET", USAGE_URL, proxy=ai_proxy(), timeout=15, read_timeout=15, headers={
+            "Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-code/2.1.112", "Content-Type": "application/json"})
+        if r.status == 429:
+            self.backoff = min(3, self.backoff + 1)
+            return dict(self.claude or {"windows": []}, plan=plan, login=True, error="محدودیت درخواست (۴۲۹)")
+        if r.status == 401:
+            return {"login": False, "plan": plan, "windows": [], "error": "ورود منقضی شده"}
+        if r.status != 200:
+            return dict(self.claude or {"windows": []}, plan=plan, login=True, error="HTTP %d" % r.status)
+        self.backoff = 0
+        body = json.loads(r.body.decode("utf-8") or "{}")
+        windows = []
+        for key, label in CLAUDE_WINDOWS:
+            w = body.get(key)
+            if isinstance(w, dict) and isinstance(w.get("utilization"), (int, float)):
+                windows.append({"label": label, "pct": float(w["utilization"]), "reset": epoch(w.get("resets_at"))})
+        return {"login": True, "plan": plan, "windows": windows, "asof": time.time()}
+
+    def _codex(self):
+        auth = os.path.join(CODEX_HOME, "auth.json")
+        if not os.path.exists(auth):
+            return {"login": False, "windows": []}
+        plan = None
+        try:
+            tok = (read_json(auth).get("tokens") or {}).get("id_token") or ""
+            payload = tok.split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+            plan = ((claims.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type") or "").title() or None
+        except (OSError, ValueError, IndexError, AttributeError, TypeError):
+            pass
+        newest = None
+        for root, _, files in os.walk(os.path.join(CODEX_HOME, "sessions")):
+            for f in files:
+                if f.startswith("rollout-") and f.endswith(".jsonl"):
+                    p = os.path.join(root, f)
+                    try:
+                        mt = os.path.getmtime(p)
+                    except OSError:
+                        continue
+                    if newest is None or mt > newest[0]:
+                        newest = (mt, p)
+        if not newest:
+            return {"login": True, "plan": plan, "windows": [], "note": "هنوز گفتگویی با Codex نشده"}
+        with open(newest[1], "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 400 * 1024))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+        for line in reversed(lines):
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            p = ev.get("payload") if isinstance(ev.get("payload"), dict) else ev
+            rl = p.get("rate_limits") or ((p.get("info") or {}).get("rate_limits") if isinstance(p.get("info"), dict) else None)
+            if not isinstance(rl, dict):
+                continue
+            when = epoch(ev.get("timestamp")) or newest[0]
+            windows = []
+            for key, mins_default in (("primary", 300), ("secondary", 10080)):
+                w = rl.get(key)
+                if not isinstance(w, dict) or not isinstance(w.get("used_percent"), (int, float)):
+                    continue
+                mins = w.get("window_minutes") or mins_default
+                reset = epoch(w.get("resets_at")) if w.get("resets_at") is not None else (
+                    when + float(w["resets_in_seconds"]) if isinstance(w.get("resets_in_seconds"), (int, float)) else None)
+                label = "%s ساعته" % int(mins // 60) if mins < 1440 else ("هفتگی" if mins == 10080 else "%s روزه" % int(mins // 1440))
+                windows.append({"label": label, "pct": float(w["used_percent"]), "reset": reset})
+            if windows:
+                return {"login": True, "plan": plan or (rl.get("plan_type") or "").title() or None,
+                        "windows": windows, "asof": when}
+        return {"login": True, "plan": plan, "windows": [], "note": "در لاگ‌های Codex هنوز عددی نیست"}
+
+
+# ---------------------------------------------------------------- models
+
+def codex_models():
+    """[(slug, name, [efforts], default effort)] that Codex lists, from its own models cache."""
+    try:
+        d = read_json(os.path.join(CODEX_HOME, "models_cache.json"), 16 * 1024 * 1024)
+    except (OSError, ValueError):
+        return []
+    out = []
+    for m in (d.get("models") if isinstance(d, dict) else d) or []:
+        if not isinstance(m, dict) or m.get("visibility") not in (None, "list"):
+            continue
+        slug = m.get("slug") or m.get("id")
+        if not slug:
+            continue
+        efforts = [e.get("effort") if isinstance(e, dict) else e for e in m.get("supported_reasoning_levels") or []]
+        out.append((slug, m.get("display_name") or slug, [e for e in efforts if e], m.get("default_reasoning_level")))
+    return out
+
+
+def codex_default_model():
+    try:
+        with open(os.path.join(CODEX_HOME, "config.toml"), encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r'\s*model\s*=\s*"([^"]+)"', line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    lst = codex_models()
+    return lst[0][0] if lst else ""
+
+
+def claude_name(model):
+    return CLAUDE_NAMES.get(model, model)
+
+
+# ---------------------------------------------------------------- running one message
+
+class Job:
+    def __init__(self, provider):
+        self.provider = provider
+        self.proc = None
+        self.started = time.time()
+        self.stopped = False
+
+    def stop(self):
+        self.stopped = True
+        p = self.proc
+        if p and p.poll() is None:
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+
+def _env():
+    env = dict(os.environ)
+    env.setdefault("HOME", "/root" if not config.ROOT else os.path.expanduser("~"))
+    env["PATH"] = os.pathsep.join([env.get("PATH", "")] + EXTRA_PATH)
+    env.setdefault("LANG", "C.UTF-8")
+    return env
+
+
+def _cmd(argv):
+    """Through the ERIS AI environment (the proxy Anthropic/OpenAI need from Iran) when it exists."""
+    if os.path.isfile(AI_ENV):
+        return ["/bin/bash", "-c", '. "$0" >/dev/null 2>&1; exec "$@"', AI_ENV] + argv
+    return argv
+
+
+def _run(job, argv, timeout):
+    os.makedirs(WORKDIR, exist_ok=True)
+    job.proc = subprocess.Popen(_cmd(argv), cwd=WORKDIR, env=_env(), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        out, err = job.proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        job.stop()
+        out, err = job.proc.communicate()
+        raise AIError("بیش از %d دقیقه طول کشید و متوقف شد" % (timeout // 60))
+    if job.stopped:
+        raise AIError("متوقف شد")
+    return job.proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+
+
+def ask_claude(job, prompt, model, effort, session_id=None, timeout=900):
+    exe = which("claude")
+    if not exe:
+        raise AIError("دستور claude روی سرور نیست")
+    argv = [exe, "-p", prompt, "--output-format", "json", "--tools", "", "--model", model]
+    if effort:
+        argv += ["--effort", effort]
+    if session_id:
+        argv += ["--resume", session_id]
+    code, out, err = _run(job, argv, timeout)
+    data = None
+    for line in reversed(out.strip().splitlines()):
+        try:
+            data = json.loads(line)
+            break
+        except ValueError:
+            continue
+    if not isinstance(data, dict):
+        tail = (err or out).strip().splitlines()[-3:]
+        raise AIError("Claude جواب نداد: %s" % " ".join(tail)[:300] if tail else "Claude جواب نداد (کد %d)" % code)
+    if data.get("is_error") or data.get("subtype") not in (None, "success"):
+        msg = data.get("result") or data.get("subtype") or "error"
+        if session_id and "No conversation found" in str(msg):
+            return ask_claude(job, prompt, model, effort, None, timeout)
+        raise AIError("Claude: %s" % str(msg)[:400])
+    u = data.get("usage") or {}
+    return {"text": data.get("result") or "", "session": data.get("session_id") or session_id,
+            "cost": data.get("total_cost_usd"), "seconds": (data.get("duration_ms") or 0) / 1000.0,
+            "tokens": (u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0)
+            + (u.get("cache_creation_input_tokens") or 0), "out_tokens": u.get("output_tokens") or 0}
+
+
+def ask_codex(job, prompt, model, effort, thread_id=None, timeout=900):
+    exe = which("codex")
+    if not exe:
+        raise AIError("دستور codex روی سرور نیست")
+    argv = [exe, "exec"]
+    if thread_id:
+        argv += ["resume"]
+    argv += ["--skip-git-repo-check", "--json", "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"']
+    if model:
+        argv += ["-m", model]
+    if effort:
+        argv += ["-c", 'model_reasoning_effort="%s"' % effort]
+    if thread_id:
+        argv += [thread_id]
+    argv += [prompt]
+    t0 = time.time()
+    code, out, err = _run(job, argv, timeout)
+    tid, texts, error, usage = thread_id, [], None, {}
+    for line in out.splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        t = ev.get("type")
+        if t == "thread.started":
+            tid = ev.get("thread_id") or tid
+        elif t == "item.completed" and (ev.get("item") or {}).get("type") == "agent_message":
+            texts.append(ev["item"].get("text") or "")
+        elif t == "turn.completed":
+            usage = ev.get("usage") or {}
+        elif t in ("error", "turn.failed"):
+            error = ev.get("message") or (ev.get("error") or {}).get("message") or error
+    if not texts:
+        raise AIError("Codex: %s" % (error or (err.strip().splitlines() or ["کد %d" % code])[-1])[:400])
+    return {"text": "\n\n".join(texts), "session": tid, "cost": None, "seconds": time.time() - t0,
+            "tokens": usage.get("input_tokens") or 0, "out_tokens": usage.get("output_tokens") or 0}
+
+
+# ---------------------------------------------------------------- Markdown -> Telegram HTML
+
+def _esc(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _inline(text):
+    parts = re.split(r"(`[^`\n]+`)", text)
+    out = []
+    for p in parts:
+        if len(p) >= 2 and p.startswith("`") and p.endswith("`"):
+            out.append("<code>%s</code>" % _esc(p[1:-1]))
+            continue
+        s = _esc(p)
+        s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+        s = re.sub(r"(?m)^#{1,6}\s+(.+)$", r"<b>\1</b>", s)
+        s = re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)",
+                   lambda m: '<a href="%s">%s</a>' % (m.group(2).replace('"', "%22"), m.group(1)), s)
+        out.append(s)
+    return "".join(out)
+
+
+def _fit(raw, render, limit):
+    """Rendered pieces of `raw`, each <= limit AFTER rendering (escaping makes text longer): whole lines
+    while they fit, a too-long line cut by characters."""
+    if len(render(raw)) <= limit:
+        return [render(raw)]
+    out, cur = [], ""
+    for line in raw.split("\n"):
+        cand = (cur + "\n" + line) if cur else line
+        if len(render(cand)) <= limit:
+            cur = cand
+            continue
+        if cur:
+            out.append(render(cur))
+        cur = line
+        while len(render(cur)) > limit:                 # one line longer than a message
+            n = len(cur)
+            while n > 1 and len(render(cur[:n])) > limit:
+                n = n * 3 // 4
+            out.append(render(cur[:n]))
+            cur = cur[n:]
+    if cur:
+        out.append(render(cur))
+    return out
+
+
+def to_messages(md, limit=3800):
+    """Telegram HTML messages (each <= limit) from a Markdown answer; code blocks become <pre>."""
+    blocks = []
+    for i, part in enumerate(re.split(r"```[^\n`]*\n?", md or "")):
+        if i % 2:
+            blocks.append(("code", part.rstrip("\n")))
+        else:
+            for para in re.split(r"\n{2,}", part):
+                if para.strip():
+                    blocks.append(("text", para.strip("\n")))
+    pieces = []
+    for kind, raw in blocks:
+        render = (lambda s: "<pre>%s</pre>" % _esc(s)) if kind == "code" else _inline
+        pieces += _fit(raw, render, limit)
+    msgs, cur = [], ""
+    for p in pieces:
+        if cur and len(cur) + 2 + len(p) > limit:
+            msgs.append(cur)
+            cur = p
+        else:
+            cur = (cur + "\n\n" + p) if cur else p
+    if cur:
+        msgs.append(cur)
+    return msgs or ["(جواب خالی)"]
+
+
+def proxy_note():
+    p = ai_proxy()
+    if not p:
+        return "مستقیم"
+    try:
+        u = urllib.parse.urlsplit(p)
+        return "%s:%s" % (u.hostname, u.port)
+    except ValueError:
+        return "پروکسی"
+
+
+def log_run(provider, model, effort, res):
+    log("ai %s %s/%s: %.0f s, %s in, %s out tokens", provider, model, effort or "-", res.get("seconds") or 0,
+        res.get("tokens"), res.get("out_tokens"))
+ERISBOT_EOF_ai_py
   put_file "$STAGE/erisbot/alerts.py" 0644 << 'ERISBOT_EOF_alerts_py'
 """Alerts: conditions (on while something is wrong) and events (one-off), sent only when they change.
 
@@ -340,18 +791,36 @@ class Sources:
         return self.cache_set("cert", cond), []
 
     def c_ip(self, now):
+        """The public IP from several services: one answer counts only when at least two services agree
+        (one odd answer — a provider's other exit — is ignored), and a change only after two rounds in a
+        row. With a static IP set, an alert stays on while the agreed IP is another one."""
         if not self.due("ip", 600, now):
-            return {}, []
-        ip = public_ip(self.app.conf.get("public_ip_urls") or [])
+            return self.cache_get("ip"), []
+        ip, _ = consensus_ip(public_ip_urls(self.app.conf))
         if not ip:
-            return {}, []
+            return self.cache_get("ip"), []           # no agreement this round: change nothing
+        static = static_ip(self.app.conf)
+        if ip == (static or self.st.get("public_ip")):
+            self.st.update(ip_candidate=None, ip_streak=0)
+            if not static:
+                return {}, []
+            return self.cache_set("ip", {}), []
+        streak = (self.st.get("ip_streak") or 0) + 1 if self.st.get("ip_candidate") == ip else 1
+        self.st.update(ip_candidate=ip, ip_streak=streak)
+        if static:
+            if streak < CONFIRM_ROUNDS:
+                return self.cache_get("ip"), []
+            return self.cache_set("ip", {"ip_static": (
+                "ip", 2, "🌐 IP عمومی سرور <code>%s</code> است، نه IP ثابت <code>%s</code>" % (esc(ip), esc(static)),
+                "✅ IP عمومی دوباره <code>%s</code> است" % esc(static))}), []
         old = self.st.get("public_ip")
-        events = []
-        if old and old != ip:
-            events.append(("ip", "ip:%s" % ip, 1, "🌐 IP عمومی عوض شد: از <code>%s</code> به <code>%s</code>" % (esc(old), esc(ip))))
-        if ip != old:
-            self.st.set("public_ip", ip)
-        return {}, events
+        if not old:
+            self.st.update(public_ip=ip, ip_candidate=None, ip_streak=0)
+            return {}, []
+        if streak < CONFIRM_ROUNDS:
+            return {}, []
+        self.st.update(public_ip=ip, ip_candidate=None, ip_streak=0)
+        return {}, [("ip", "ip:%s" % ip, 1, "🌐 IP عمومی عوض شد: از <code>%s</code> به <code>%s</code>" % (esc(old), esc(ip)))]
 
     def c_backup(self, now):
         cond = {}
@@ -400,16 +869,51 @@ def cert_end(pem):
         return None
 
 
+CONFIRM_ROUNDS = 2
+DEAD_IP_URLS = ("https://ifconfig.me/ip",)        # answers 403 to scripts now
+
+
+def public_ip_urls(conf):
+    urls = [u for u in conf.get("public_ip_urls") or [] if u not in DEAD_IP_URLS]
+    return urls or list(config.DEFAULTS["public_ip_urls"])
+
+
+def static_ip(conf):
+    s = str((conf.get("public_ip") or {}).get("static") or "").strip()
+    try:
+        return str(ipaddress.ip_address(s)) if s else ""
+    except ValueError:
+        return ""
+
+
+def ask_ip(url):
+    """One service's answer (an IP string) or None; direct, never through a proxy."""
+    try:
+        r = net.request("GET", url, proxy=None, timeout=8, read_timeout=8)
+        if r.status != 200:
+            return None
+        ip = r.body.decode("ascii", "replace").strip()
+        return str(ipaddress.ip_address(ip))
+    except (OSError, ValueError, Exception):  # noqa: B014 - any failure: this service gave no answer
+        return None
+
+
+def consensus_ip(urls, ask=ask_ip):
+    """(the IP at least two services agree on — or the only one when one service is set up — or None,
+    [(url, answer)])."""
+    answers = [(u, ask(u)) for u in urls]
+    counts = {}
+    for _, ip in answers:
+        if ip:
+            counts[ip] = counts.get(ip, 0) + 1
+    need = 1 if len(urls) == 1 else 2
+    best = max(counts.items(), key=lambda kv: kv[1], default=(None, 0))
+    return (best[0] if best[1] >= need else None), answers
+
+
 def public_ip(urls):
-    for u in urls:
-        try:
-            r = net.request("GET", u, proxy=None, timeout=10, read_timeout=10)
-            ip = r.body.decode("ascii", "replace").strip()
-            ipaddress.ip_address(ip)
-            return ip
-        except (OSError, ValueError, Exception):  # noqa: B014 - any failure: try the next service
-            continue
-    return None
+    """The agreed public IP (kept for callers of older versions)."""
+    return consensus_ip(urls)[0]
 ERISBOT_EOF_alerts_py
   put_file "$STAGE/erisbot/app.py" 0644 << 'ERISBOT_EOF_app_py'
 """The bot: long polling (getUpdates), who may talk to it, screens, confirmations and the background jobs."""
@@ -424,6 +928,7 @@ from .ui import Btn, Screen
 from .util import esc, log
 
 INPUT_TTL = 600
+COMMANDS = {"/ai": "ai", "/files": "nas", "/weather": "wx"}
 
 
 class Action:
@@ -453,7 +958,7 @@ class Ctx:
         return self.app.bot.send(self.chat_id, text, markup)
 
     def ask_text(self, kind, prompt, *args, back=None):
-        """Wait for the next text message of this chat (search, a port, a name, ...)."""
+        """Wait for the next message of this chat (search, a port, a name, a file, a location...)."""
         self.app.session(self.chat_id)["input"] = {"kind": kind, "args": list(args), "exp": time.time() + INPUT_TTL}
         rows = [[Btn("✖️ لغو", "cancel_input", *(back or ("menu", [])), style=ui.PRIMARY)]]
         return Screen(prompt, rows)
@@ -486,6 +991,11 @@ class App:
         self.pool = ThreadPoolExecutor(max_workers=workers) if workers else None
         self.stop_evt = threading.Event()
         self.ignored = {}
+        self.weather_tick = None
+        if self.state.get("styles_refused") and tg.stale_refusal(self.state.get("styles_refused_reason") or ""):
+            # 1.1.0 turned colours off when a button was pressed twice ("message is not modified")
+            self.state.update(styles_refused=False, styles_refused_reason="")
+            log("button colours back on (the old refusal was an unchanged edit, not the API refusing colours)")
         from . import screens
         screens.register(self)
 
@@ -639,6 +1149,9 @@ class App:
             if text in (ui.DASH_TEXT, "/dashboard"):
                 sess["input"] = None
                 return self.run(ctx, "dash", [])
+            if text in COMMANDS:                   # also ends a chat with Claude/Codex or an upload
+                sess["input"] = None
+                return self.run(ctx, COMMANDS[text], [])
             inp = sess.get("input")
             if inp and inp["exp"] > time.time():
                 fn, write = self.inputs.get(inp["kind"], (None, True))
@@ -653,6 +1166,13 @@ class App:
                 if isinstance(res, Screen):
                     self.show(ctx, res)
                 return res
+            from .s_files import incoming_file
+            f = incoming_file(msg)
+            if f:                                  # a file without a question: offer to save it on the NAS
+                return self.run(ctx, "nas_incoming", list(f))
+            loc = msg.get("location")
+            if isinstance(loc, dict) and "latitude" in loc:
+                return self.run(ctx, "wx_pick", ["موقعیت من", loc["latitude"], loc["longitude"]])
             if text and not text.startswith("/") and self.marzban.available():
                 return self.run(ctx, "mz_search", [text, 0])
             return self.run(ctx, "menu", [])
@@ -731,6 +1251,8 @@ class App:
             try:
                 self.sender.tick()
                 self.daily_report()
+                if self.weather_tick:
+                    self.weather_tick()
                 self.cbs.save()
             except Exception as e:
                 log("schedule round failed: %r", e)
@@ -1573,7 +2095,13 @@ DEFAULTS = {
     "upload": {"write_timeout": 60, "read_timeout": 180, "retries": 8},
     "daily_report": {"enabled": False, "at": "09:00"},
     "alerts": {"user_days": 3, "user_percent": 10, "cert_days": 10, "cpu_fan_temp": 75, "gpu_fan_temp": 80},
-    "public_ip_urls": ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"],
+    "public_ip_urls": ["https://api.ipify.org", "https://ipv4.icanhazip.com", "https://checkip.amazonaws.com"],
+    "public_ip": {"static": ""},       # the server's static IP: alert only when the agreed IP is another one
+    "mz_presets": {"gb": [10, 20, 50, 100, 200], "days": [7, 30, 60, 90, 180]},
+    "ai": {"timeout": 900, "claude_models": ["opus", "sonnet", "haiku"],
+           "efforts": ["low", "medium", "high", "xhigh", "max"]},
+    "nas": {"session_minutes": 30, "max_upload_mb": 20, "send_piece_mb": 45},
+    "weather": {"city": "", "lat": None, "lon": None, "daily": False, "at": "07:30"},
     "rate_limit": {"events": 20, "seconds": 10},
     "services": ["ssh", "x-ui", "haproxy", "nginx", "xray-site", "smbd", "docker", "eris-guard", "eris-dashboard",
                  "claude-f-web", "smartmontools", "eris-bot", "eris-fan"],
@@ -2764,6 +3292,387 @@ class Marzban:
     def set_status(self, name, status):
         return self.modify(name, status=status)
 ERISBOT_EOF_marzban_py
+  put_file "$STAGE/erisbot/nas.py" 0644 << 'ERISBOT_EOF_nas_py'
+"""NAS files for the bot: log in as a user of this server (its own password), browse the shared folders,
+upload into them and download from them. Every file operation runs as that user (nasop.py under setpriv),
+so it can do exactly what the user can do over SMB, nothing more. Passwords are never stored or logged.
+"""
+import ctypes
+import ctypes.util
+import hmac
+import json
+import os
+import pwd
+import subprocess
+import sys
+import threading
+import time
+import xml.etree.ElementTree as ET
+
+from . import config
+from .util import log
+
+SHADOW = config.R("/etc/shadow")
+OMV_CONFIG = config.R("/etc/openmediavault/config.xml")
+SRV = config.R("/srv")
+NASOP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nasop.py")
+MAX_FAILS, FAIL_WINDOW = 5, 900
+
+_crypt_lock = threading.Lock()
+_libcrypt = None
+
+
+class NasError(Exception):
+    pass
+
+
+ERRORS_FA = {"permission denied": "اجازه‌ی دسترسی ندارید", "not found": "پیدا نشد", "already exists": "این اسم هست",
+             "bad name": "اسم نامعتبر است", "outside the shared folder": "بیرون از پوشه‌ی اشتراکی است",
+             "not empty": "پوشه خالی نیست", "not a file": "فایل نیست"}
+
+
+def crypt(password, setting):
+    """crypt(3) from libcrypt (yescrypt, sha512...); Python 3.13 has no crypt module."""
+    global _libcrypt
+    with _crypt_lock:
+        if _libcrypt is None:
+            name = ctypes.util.find_library("crypt") or "libcrypt.so.1"
+            _libcrypt = ctypes.CDLL(name)
+            _libcrypt.crypt.restype = ctypes.c_char_p
+            _libcrypt.crypt.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        r = _libcrypt.crypt(password.encode("utf-8"), setting.encode("utf-8"))
+    return r.decode("utf-8", "replace") if r else None
+
+
+def shadow_hash(user):
+    try:
+        with open(SHADOW, encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split(":")
+                if len(parts) > 1 and parts[0] == user:
+                    return parts[1]
+    except OSError:
+        return None
+    return None
+
+
+def account(user):
+    """(uid, gid, home) of a normal user of this server (uid 1000-59999), else None."""
+    try:
+        pw = pwd.getpwnam(user)
+    except KeyError:
+        return None
+    if not 1000 <= pw.pw_uid < 60000:
+        return None
+    return pw.pw_uid, pw.pw_gid, pw.pw_dir
+
+
+class Auth:
+    def __init__(self, verify=None):
+        self.fails = {}
+        self.lock = threading.Lock()
+        self.verify_fn = verify
+
+    def locked(self, chat_id, now=None):
+        now = now or time.time()
+        with self.lock:
+            lst = [t for t in self.fails.get(chat_id, []) if now - t < FAIL_WINDOW]
+            self.fails[chat_id] = lst
+            return max(0, int(lst[0] + FAIL_WINDOW - now)) if len(lst) >= MAX_FAILS else 0
+
+    def check(self, chat_id, user, password):
+        """(uid, gid, home) when the password is right; raises NasError otherwise."""
+        if self.locked(chat_id):
+            raise NasError("ورودهای اشتباه زیاد بود؛ %s دقیقه‌ی دیگر دوباره امتحان کنید." % (self.locked(chat_id) // 60 + 1))
+        acc = account(user) if user.isascii() else None
+        ok = False
+        if acc:
+            if self.verify_fn:
+                ok = self.verify_fn(user, password)
+            else:
+                h = shadow_hash(user)
+                if h and h[0] not in "!*" and len(h) > 3:
+                    got = crypt(password, h)
+                    ok = bool(got) and hmac.compare_digest(got, h)
+        if not ok:
+            with self.lock:
+                self.fails.setdefault(chat_id, []).append(time.time())
+            log("nas: failed login for %r from chat %s", user[:32], chat_id)
+            raise NasError("نام کاربری یا رمز اشتباه است.")
+        with self.lock:
+            self.fails.pop(chat_id, None)
+        log("nas: %s logged in from chat %s", user, chat_id)
+        return acc
+
+
+def shares():
+    """[(name, path)] of the OMV shared folders on data disks (/srv/...), else the folders under /srv/*."""
+    out = []
+    try:
+        root = ET.parse(OMV_CONFIG).getroot()
+        mnt = {m.findtext("uuid"): m.findtext("dir") for m in root.iter("mntent")}
+        for s in root.iter("sharedfolder"):
+            base = mnt.get(s.findtext("mntentref")) or ""
+            if not base.startswith("/srv/"):
+                continue
+            path = os.path.normpath(os.path.join(config.R(base), (s.findtext("reldirpath") or "").strip("/")))
+            if os.path.isdir(path):
+                out.append((s.findtext("name") or os.path.basename(path), path))
+    except (OSError, ET.ParseError):
+        pass
+    if not out and os.path.isdir(SRV):
+        for disk in sorted(os.listdir(SRV)):
+            d = os.path.join(SRV, disk)
+            if os.path.isdir(d):
+                for n in sorted(os.listdir(d)):
+                    if os.path.isdir(os.path.join(d, n)) and n != "lost+found":
+                        out.append((n, os.path.join(d, n)))
+    seen, uniq = set(), []
+    for name, path in out:
+        if path not in seen:
+            seen.add(path)
+            uniq.append((name, path))
+    return uniq
+
+
+def share_of(path, lst=None):
+    """(name, root) of the shared folder that holds `path`, else None."""
+    real = os.path.realpath(path)
+    for name, root in lst or shares():
+        r = os.path.realpath(root)
+        if real == r or real.startswith(r.rstrip("/") + "/"):
+            return name, root
+    return None
+
+
+def run_as(sess, root, op, *args, stdin=None, stdout=None, timeout=600):
+    """nasop.py as the session's user. Returns the JSON answer (or None when stdout goes to a file)."""
+    cmd = [sys.executable, "-I", NASOP, root, op] + list(args)
+    if os.geteuid() == 0 and not config.ROOT:
+        cmd = ["setpriv", "--reuid=%d" % sess["uid"], "--regid=%d" % sess["gid"], "--init-groups",
+               "--no-new-privs", "--inh-caps=-all", "--"] + cmd
+    try:
+        p = subprocess.run(cmd, stdin=stdin if stdin is not None else subprocess.DEVNULL,
+                           stdout=stdout if stdout is not None else subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=timeout, cwd="/", env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"})
+    except subprocess.TimeoutExpired:
+        raise NasError("کار بیش از حد طول کشید")
+    if stdout is not None:
+        if p.returncode == 0:
+            return None
+        stdout.seek(0)                        # the error answer went into the output file
+        raw = stdout.read(2000).decode("utf-8", "replace")
+    else:
+        raw = p.stdout.decode("utf-8", "replace") if isinstance(p.stdout, bytes) else ""
+    try:
+        data = json.loads(raw or "{}")
+    except ValueError:
+        data = {"error": (p.stderr.decode("utf-8", "replace").strip().splitlines() or ["failed"])[-1][:200]}
+    if p.returncode != 0 or "error" in data:
+        e = data.get("error") or "failed"
+        raise NasError(ERRORS_FA.get(e, e))
+    return data
+ERISBOT_EOF_nas_py
+  put_file "$STAGE/erisbot/nasop.py" 0644 << 'ERISBOT_EOF_nasop_py'
+"""One file operation on the NAS, run AS the logged-in user (setpriv drops root before this starts),
+so the system's own permissions decide what is allowed. Standard library only; run with python3 -I.
+
+    nasop.py ROOT OP ARGS...      ROOT: the shared folder every path must stay inside
+    list PATH | stat PATH | mkdir DIR NAME | put DIR NAME (data on stdin) | get PATH (data to stdout)
+    delete PATH | rename PATH NEWNAME
+Answers one JSON object on stdout (except get), {"error": "..."} on failure (exit code 1).
+"""
+import json
+import os
+import stat
+import sys
+
+BAD_NAMES = ("", ".", "..")
+
+
+def fail(msg):
+    sys.stdout.write(json.dumps({"error": msg}, ensure_ascii=False))
+    sys.exit(1)
+
+
+def is_inside(root, path):
+    real_root = os.path.realpath(root)
+    real = os.path.realpath(path)
+    return real == real_root or real.startswith(real_root.rstrip("/") + "/")
+
+
+def inside(root, path):
+    """The real path of `path` when it is root or under it (symlinks resolved), else fail."""
+    if not is_inside(root, path):
+        fail("outside the shared folder")
+    return os.path.realpath(path)
+
+
+def check_name(name):
+    if name in BAD_NAMES or "/" in name or "\0" in name or len(name.encode("utf-8")) > 255:
+        fail("bad name")
+    return name
+
+
+def entry(path, name):
+    st = os.lstat(os.path.join(path, name))
+    return {"name": name, "size": st.st_size, "mtime": int(st.st_mtime),
+            "dir": stat.S_ISDIR(st.st_mode), "link": stat.S_ISLNK(st.st_mode)}
+
+
+def op_list(root, path):
+    p = inside(root, path)
+    try:
+        names = os.listdir(p)
+    except PermissionError:
+        fail("permission denied")
+    except FileNotFoundError:
+        fail("not found")
+    items = []
+    for n in names:
+        try:
+            e = entry(p, n)
+            if e["link"]:
+                if not is_inside(root, os.path.join(p, n)):
+                    continue                       # a link out of the shared folder is not shown
+                try:
+                    t = os.stat(os.path.join(p, n))
+                except OSError:
+                    continue
+                e.update(dir=stat.S_ISDIR(t.st_mode), size=t.st_size)
+            items.append(e)
+        except OSError:
+            continue
+    return {"path": p, "items": items, "writable": os.access(p, os.W_OK | os.X_OK)}
+
+
+def op_stat(root, path):
+    p = inside(root, path)
+    try:
+        st = os.stat(p)
+    except PermissionError:
+        fail("permission denied")
+    except FileNotFoundError:
+        fail("not found")
+    return {"path": p, "size": st.st_size, "mtime": int(st.st_mtime), "dir": stat.S_ISDIR(st.st_mode),
+            "readable": os.access(p, os.R_OK), "writable": os.access(os.path.dirname(p), os.W_OK | os.X_OK)}
+
+
+def op_mkdir(root, d, name):
+    p = os.path.join(inside(root, d), check_name(name))
+    try:
+        os.mkdir(p, 0o775)
+    except FileExistsError:
+        fail("already exists")
+    except PermissionError:
+        fail("permission denied")
+    return {"path": p}
+
+
+def free_name(d, name):
+    base, ext = os.path.splitext(name)
+    cand, i = name, 2
+    while os.path.lexists(os.path.join(d, cand)):
+        cand = "%s (%d)%s" % (base, i, ext)
+        i += 1
+    return cand
+
+
+def op_put(root, d, name):
+    d = inside(root, d)
+    name = free_name(d, check_name(name))
+    final = os.path.join(d, name)
+    tmp = os.path.join(d, ".%s.eris-bot-upload" % name)
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o664)
+    except PermissionError:
+        fail("permission denied")
+    except FileExistsError:
+        fail("an upload with this name is already running")
+    size = 0
+    try:
+        with os.fdopen(fd, "wb") as f:
+            while True:
+                chunk = sys.stdin.buffer.read(1 << 16)
+                if not chunk:
+                    break
+                f.write(chunk)
+                size += len(chunk)
+        os.rename(tmp, final)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return {"path": final, "name": name, "size": size}
+
+
+def op_get(root, path):
+    p = inside(root, path)
+    try:
+        f = open(p, "rb")
+    except PermissionError:
+        fail("permission denied")
+    except (FileNotFoundError, IsADirectoryError):
+        fail("not a file")
+    with f:
+        out = sys.stdout.buffer
+        while True:
+            chunk = f.read(1 << 16)
+            if not chunk:
+                break
+            out.write(chunk)
+        out.flush()
+    sys.exit(0)
+
+
+def op_delete(root, path):
+    p = inside(root, path)
+    if p == os.path.realpath(root):
+        fail("the shared folder itself cannot be deleted")
+    try:
+        if os.path.isdir(p) and not os.path.islink(p):
+            os.rmdir(p)
+        else:
+            os.remove(p)
+    except OSError as e:
+        fail("not empty" if e.errno == 39 else ("permission denied" if isinstance(e, PermissionError) else str(e)))
+    return {"deleted": p}
+
+
+def op_rename(root, path, new):
+    p = inside(root, path)
+    if p == os.path.realpath(root):
+        fail("the shared folder itself cannot be renamed")
+    dest = os.path.join(os.path.dirname(p), check_name(new))
+    if os.path.lexists(dest):
+        fail("already exists")
+    try:
+        os.rename(p, dest)
+    except PermissionError:
+        fail("permission denied")
+    return {"path": dest}
+
+
+OPS = {"list": (op_list, 1), "stat": (op_stat, 1), "mkdir": (op_mkdir, 2), "put": (op_put, 2), "get": (op_get, 1),
+       "delete": (op_delete, 1), "rename": (op_rename, 2)}
+
+
+def main(argv):
+    if len(argv) < 3 or argv[2] not in OPS:
+        fail("usage: nasop.py ROOT OP ARGS")
+    fn, n = OPS[argv[2]]
+    args = argv[3:]
+    if len(args) != n:
+        fail("wrong arguments")
+    sys.stdout.write(json.dumps(fn(argv[1], *args), ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    os.umask(0o002)
+    main(sys.argv)
+ERISBOT_EOF_nasop_py
   put_file "$STAGE/erisbot/net.py" 0644 << 'ERISBOT_EOF_net_py'
 """HTTP(S) over a direct connection, an HTTP proxy (CONNECT) or a SOCKS5 proxy (DNS on the proxy side).
 
@@ -3454,6 +4363,295 @@ class QR:
 def png(data, ecl="M"):
     return QR(data, ecl).png()
 ERISBOT_EOF_qr_py
+  put_file "$STAGE/erisbot/s_ai.py" 0644 << 'ERISBOT_EOF_s_ai_py'
+"""🤖 Claude and Codex: plan usage, model and effort, and chatting (each message continues the chat)."""
+import os
+import threading
+import time
+
+from . import ai, config, store, tg
+from .ui import DANGER, PRIMARY, SUCCESS, Btn, Screen
+from .util import bar, duration, esc, fa, log
+
+CHAT_TTL = 6 * 3600
+PROVIDERS = {"claude": "Claude", "codex": "Codex"}
+
+
+def register(app):
+    st = store.JsonState(os.path.join(config.STATE, "ai.json"), {})
+    usage = ai.Usage()
+    jobs = {}
+    jobs_lock = threading.Lock()
+    app.ai_jobs = jobs
+
+    def conf():
+        return app.conf.get("ai") or config.DEFAULTS["ai"]
+
+    def prefs(chat_id):
+        p = (st.get("chats") or {}).get(str(chat_id)) or {}
+        c = p.setdefault("claude", {})
+        c.setdefault("model", "sonnet")
+        c.setdefault("effort", "high")
+        x = p.setdefault("codex", {})
+        if not x.get("model"):
+            x["model"] = ai.codex_default_model()
+        x.setdefault("effort", "medium")
+        p.setdefault("provider", "claude")
+        return p
+
+    def save_prefs(chat_id, p):
+        chats = st.get("chats") or {}
+        chats[str(chat_id)] = p
+        st.set("chats", chats)
+
+    def model_label(provider, p):
+        q = p[provider]
+        if provider == "claude":
+            name = ai.claude_name(q["model"])
+        else:
+            name = dict((m[0], m[1]) for m in ai.codex_models()).get(q["model"], q["model"]) or "پیش‌فرض"
+        return "%s · %s" % (name, ai.EFFORT_FA.get(q.get("effort"), q.get("effort") or "پیش‌فرض"))
+
+    def window_lines(info):
+        out = []
+        for w in info.get("windows") or []:
+            pct = max(0.0, min(100.0, w["pct"]))
+            reset = ""
+            if w.get("reset"):
+                left = w["reset"] - time.time()
+                reset = " · ریست %s" % ("تا " + duration(left, 2) if left > 0 else "الان")
+            icon = "🔴" if pct >= 90 else ("🟠" if pct >= 70 else "🟢")
+            out.append("  %s %s: <code>%s</code> %s٪%s" % (icon, w["label"], bar(pct, 10), fa("%.0f" % pct), reset))
+        return out
+
+    def usage_text(u):
+        lines = []
+        for key, title in (("claude", "🟣 <b>Claude</b>"), ("codex", "🟢 <b>Codex</b>")):
+            info = u.get(key) or {}
+            head = title + (" — %s" % esc(info["plan"]) if info.get("plan") else "")
+            if info.get("login") is False:
+                lines.append(head + ": ❌ وارد نشده (در Claude F Web، تنظیمات ← حساب‌ها)")
+                continue
+            lines.append(head)
+            wl = window_lines(info)
+            lines += wl or ["  " + esc(info.get("note") or "عددی نیست")]
+            if info.get("error"):
+                lines.append("  ⚠️ %s" % esc(info["error"]))
+            if info.get("asof") and time.time() - info["asof"] > 900:
+                lines.append("  <i>(به‌روز تا %s پیش)</i>" % duration(time.time() - info["asof"], 1))
+        return lines
+
+    # -------------------------------------------------------- the main screen
+    @app.action("ai")
+    def main(ctx, notice=None, force=False):
+        ctx.session()["ai_chat"] = None
+        p = prefs(ctx.chat_id)
+        lines = ["🤖 <b>هوش مصنوعی</b>", ""] + usage_text(usage.get(force)) + [
+            "", "⚙️ Claude: %s" % esc(model_label("claude", p)),
+            "⚙️ Codex: %s" % esc(model_label("codex", p)),
+            "🌐 مسیر: %s" % esc(ai.proxy_note()),
+            "", "💬 چت: هر پیام شما ادامه‌ی همان گفتگو است؛ «🆕 گفتگوی تازه» از اول شروع می‌کند.",
+            "🔒 در چت، مدل فقط جواب می‌دهد (به فایل‌ها و دستورهای سرور دسترسی ندارد)."]
+        rows = [[Btn("💬 چت با Claude", "ai_chat", "claude", style=SUCCESS), Btn("💬 چت با Codex", "ai_chat", "codex", style=SUCCESS)],
+                [Btn("🧠 مدل Claude", "ai_models", "claude", style=PRIMARY), Btn("🧠 مدل Codex", "ai_models", "codex", style=PRIMARY)],
+                [Btn("⚡️ افورت Claude", "ai_efforts", "claude", style=PRIMARY), Btn("⚡️ افورت Codex", "ai_efforts", "codex", style=PRIMARY)],
+                [Btn("🔄 مصرف تازه", "ai_fresh", style=PRIMARY)]]
+        s = Screen("\n".join(lines), rows, refresh=("ai", []), back=("menu", []))
+        s.notice = notice
+        return s
+
+    @app.action("ai_fresh", view=False)
+    def fresh(ctx):
+        return main(ctx, "مصرف دوباره خوانده شد", True)
+
+    # -------------------------------------------------------- model / effort
+    @app.action("ai_models")
+    def models(ctx, provider):
+        p = prefs(ctx.chat_id)
+        cur = p[provider]["model"]
+        rows = []
+        if provider == "claude":
+            for m in conf().get("claude_models") or ai.CLAUDE_NAMES:
+                rows.append([Btn(("✅ " if m == cur else "") + ai.claude_name(m), "ai_model_to", provider, m,
+                                 style=SUCCESS if m == cur else PRIMARY)])
+            note = "نام کوتاه = تازه‌ترین نسخه‌ای که Claude Code روی سرور می‌شناسد."
+        else:
+            lst = ai.codex_models()
+            for slug, name, efforts, _ in lst:
+                rows.append([Btn(("✅ " if slug == cur else "") + name, "ai_model_to", provider, slug,
+                                 style=SUCCESS if slug == cur else PRIMARY)])
+            note = "از فهرست خود Codex." if lst else "فهرست مدل‌های Codex پیدا نشد (یک بار Codex را اجرا کنید)."
+        rows.append([Btn("✏️ اسم مدل دیگر", "ai_model_ask", provider, style=PRIMARY)])
+        return Screen("🧠 <b>مدل %s</b>\nالان: <code>%s</code>\n%s" % (PROVIDERS[provider], esc(cur), note), rows,
+                      back=("ai", []))
+
+    @app.action("ai_model_to", write=True, view=False)
+    def model_to(ctx, provider, model):
+        p = prefs(ctx.chat_id)
+        p[provider]["model"] = model
+        if provider == "codex":
+            efforts = dict((m[0], m[2]) for m in ai.codex_models()).get(model)
+            if efforts and p[provider].get("effort") not in efforts:
+                p[provider]["effort"] = dict((m[0], m[3]) for m in ai.codex_models()).get(model) or efforts[0]
+        save_prefs(ctx.chat_id, p)
+        log("ai %s model set to %s by chat %s", provider, model, ctx.chat_id)
+        return back_to(ctx, provider, "✅ مدل: %s" % model)
+
+    @app.action("ai_model_ask", write=True, view=False)
+    def model_ask(ctx, provider):
+        return ctx.ask_text("ai_model", "✏️ اسم کامل مدل %s را بفرستید (مثلاً <code>%s</code>):" % (
+            PROVIDERS[provider], "claude-sonnet-4-6" if provider == "claude" else "gpt-5.6-terra"), provider,
+            back=("ai_models", [provider]))
+
+    @app.text_input("ai_model")
+    def model_input(ctx, text, msg, provider):
+        m = text.strip()
+        ctx.msg_id = None
+        if not m or len(m) > 80 or not all(ch.isalnum() or ch in "-._:[]" for ch in m):
+            return Screen("❌ اسم مدل نامعتبر است.", back=("ai_models", [provider]))
+        return model_to(ctx, provider, m)
+
+    @app.action("ai_efforts")
+    def efforts(ctx, provider):
+        p = prefs(ctx.chat_id)
+        cur = p[provider].get("effort")
+        if provider == "claude":
+            lst = conf().get("efforts") or ai.CLAUDE_EFFORTS
+        else:
+            lst = dict((m[0], m[2]) for m in ai.codex_models()).get(p[provider]["model"]) or ["low", "medium", "high"]
+        btns = [Btn(("✅ " if e == cur else "") + ai.EFFORT_FA.get(e, e), "ai_effort_to", provider, e,
+                    style=SUCCESS if e == cur else PRIMARY) for e in lst]
+        rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+        return Screen("⚡️ <b>افورت %s</b> (%s)\nافورت بیشتر = فکر بیشتر، جواب کندتر و مصرف بیشتر.\nالان: %s" % (
+            PROVIDERS[provider], esc(p[provider]["model"]), esc(ai.EFFORT_FA.get(cur, cur or "—"))), rows, back=("ai", []))
+
+    @app.action("ai_effort_to", write=True, view=False)
+    def effort_to(ctx, provider, effort):
+        p = prefs(ctx.chat_id)
+        p[provider]["effort"] = effort
+        save_prefs(ctx.chat_id, p)
+        return back_to(ctx, provider, "✅ افورت: %s" % ai.EFFORT_FA.get(effort, effort))
+
+    def back_to(ctx, provider, notice):
+        if ctx.session().get("ai_chat") == provider:
+            return chat(ctx, provider, notice)
+        return main(ctx, notice)
+
+    # -------------------------------------------------------- chatting
+    def arm(ctx, provider):
+        ctx.session()["input"] = {"kind": "ai_msg", "args": [provider], "exp": time.time() + CHAT_TTL}
+        ctx.session()["ai_chat"] = provider
+
+    def chat_rows(provider):
+        return [[Btn("🆕 گفتگوی تازه", "ai_new", provider, style=SUCCESS), Btn("🚪 خروج از چت", "ai_exit", style=PRIMARY)],
+                [Btn("🧠 مدل", "ai_models", provider, style=PRIMARY), Btn("⚡️ افورت", "ai_efforts", provider, style=PRIMARY)]]
+
+    @app.action("ai_chat", write=True, view=False)
+    def chat(ctx, provider, notice=None):
+        p = prefs(ctx.chat_id)
+        p["provider"] = provider
+        save_prefs(ctx.chat_id, p)
+        arm(ctx, provider)
+        sid = p[provider].get("session")
+        s = Screen("💬 <b>چت با %s</b> — %s\n%s\n\nپیامتان را بفرستید. تا وقتی «🚪 خروج» را نزنید، هر پیام به %s می‌رود." % (
+            PROVIDERS[provider], esc(model_label(provider, p)),
+            "🧵 ادامه‌ی گفتگوی قبلی" if sid else "🆕 گفتگوی تازه", PROVIDERS[provider]), chat_rows(provider))
+        s.notice = notice
+        return s
+
+    @app.action("ai_new", write=True, view=False)
+    def new(ctx, provider):
+        p = prefs(ctx.chat_id)
+        p[provider]["session"] = None
+        save_prefs(ctx.chat_id, p)
+        return chat(ctx, provider, "🆕 گفتگوی تازه")
+
+    @app.action("ai_exit", view=False)
+    def exit_chat(ctx):
+        ctx.session()["input"] = None
+        ctx.session()["ai_chat"] = None
+        return main(ctx, "از چت خارج شدید")
+
+    @app.action("ai_stop", write=True, view=False)
+    def stop(ctx):
+        with jobs_lock:
+            j = jobs.get(ctx.chat_id)
+        if ctx.session().get("ai_chat"):
+            arm(ctx, ctx.session()["ai_chat"])       # a button ends text questions; the chat goes on
+        if j:
+            j.stop()
+            ctx.answer("⏹ متوقف می‌شود…")
+        else:
+            ctx.answer("کاری در جریان نیست")
+        return None
+
+    @app.text_input("ai_msg")
+    def on_msg(ctx, text, msg, provider):
+        arm(ctx, provider)                      # stays in chat mode
+        text = (text or msg.get("caption") or "").strip()
+        if not text:
+            app.bot.send(ctx.chat_id, "✍️ در چت فقط متن فرستاده می‌شود.")
+            return None
+        with jobs_lock:
+            if ctx.chat_id in jobs:
+                app.bot.send(ctx.chat_id, "⏳ هنوز جواب پیام قبلی آماده نشده.",
+                             app.render(ctx.chat_id, Screen("", [[Btn("⏹ توقف", "ai_stop", style=DANGER)]]))[1])
+                return None
+            job = jobs[ctx.chat_id] = ai.Job(provider)
+        p = prefs(ctx.chat_id)
+        q = dict(p[provider])
+        wait = app.bot.send(ctx.chat_id, "⏳ %s (%s) دارد فکر می‌کند…" % (PROVIDERS[provider], esc(model_label(provider, p))),
+                            app.render(ctx.chat_id, Screen("", [[Btn("⏹ توقف", "ai_stop", style=DANGER)]]))[1])
+        threading.Thread(target=answer, args=(ctx.chat_id, provider, q, text, job, wait.get("message_id")),
+                         name="ai-%s" % ctx.chat_id, daemon=True).start()
+        return None
+
+    def answer(chat_id, provider, q, text, job, wait_id):
+        typing = threading.Event()
+
+        def keep_typing():
+            while not typing.wait(5):
+                try:
+                    app.bot.call("sendChatAction", {"chat_id": chat_id, "action": "typing"}, attempts=1)
+                except (tg.TelegramError, OSError):
+                    pass
+        threading.Thread(target=keep_typing, daemon=True).start()
+        timeout = int(conf().get("timeout") or 900)
+        try:
+            if provider == "claude":
+                res = ai.ask_claude(job, text, q["model"], q.get("effort"), q.get("session"), timeout)
+            else:
+                res = ai.ask_codex(job, text, q.get("model"), q.get("effort"), q.get("session"), timeout)
+            ai.log_run(provider, q.get("model"), q.get("effort"), res)
+            p = prefs(chat_id)
+            p[provider]["session"] = res.get("session")
+            save_prefs(chat_id, p)
+            msgs = ai.to_messages(res["text"])
+            foot = "<i>%s · %s · %s%s</i>" % (esc(PROVIDERS[provider]), esc(model_label(provider, p)),
+                                               duration(res.get("seconds") or 0, 1),
+                                               " · $%.3f" % res["cost"] if res.get("cost") else "")
+            if len(msgs[-1]) + len(foot) + 2 <= 4000:
+                msgs[-1] += "\n\n" + foot
+            else:
+                msgs.append(foot)
+        except ai.AIError as e:
+            msgs = ["❌ %s" % esc(e)]
+        except Exception as e:  # noqa: BLE001 - the chat must hear about any failure
+            log("ai answer failed: %r", e)
+            msgs = ["❌ خطا: %s" % esc(e)]
+        finally:
+            typing.set()
+            with jobs_lock:
+                jobs.pop(chat_id, None)
+        app.bot.delete(chat_id, wait_id)
+        for m in msgs:
+            try:
+                app.bot.send(chat_id, m)
+            except tg.TelegramError as e:
+                if e.code != 400:
+                    raise
+                app.bot.send(chat_id, esc(m.replace("<pre>", "").replace("</pre>", "")))   # HTML Telegram refused
+ERISBOT_EOF_s_ai_py
   put_file "$STAGE/erisbot/s_alerts.py" 0644 << 'ERISBOT_EOF_s_alerts_py'
 """Alerts: the active ones, history, each type on/off, silence for a while."""
 import time
@@ -4057,13 +5255,426 @@ def after_start(app):
                 else "ℹ️ تست پایداری قبلی با ری‌استارت ربات قطع شد.")
         app.notify(text, chats=[chat] if chat else None)
 ERISBOT_EOF_s_fans_py
+  put_file "$STAGE/erisbot/s_files.py" 0644 << 'ERISBOT_EOF_s_files_py'
+"""📁 NAS files: log in with a user of this server, browse the shared folders, upload files sent to the
+bot into any folder, send NAS files to Telegram, new folder / rename / delete. Owner chats only."""
+import os
+import threading
+import time
+
+from . import config, nas, tg
+from .ui import PRIMARY, SUCCESS, Btn, Screen, pager
+from .util import esc, fa, human, log
+
+PAGE = 10
+UP_TTL = 1800
+
+
+def incoming_file(msg):
+    """(file_id, name, size) of a file in a message (document, photo, video, audio, voice...), else None."""
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(msg.get("date") or time.time()))
+    for key, ext in (("document", ""), ("video", ".mp4"), ("audio", ".mp3"), ("voice", ".ogg"),
+                     ("animation", ".mp4"), ("video_note", ".mp4")):
+        f = msg.get(key)
+        if isinstance(f, dict) and f.get("file_id"):
+            return f["file_id"], f.get("file_name") or "%s-%s%s" % (key, stamp, ext), int(f.get("file_size") or 0)
+    photos = msg.get("photo")
+    if isinstance(photos, list) and photos:
+        big = max(photos, key=lambda p: p.get("file_size") or p.get("width", 0) * p.get("height", 0))
+        return big["file_id"], "photo-%s.jpg" % stamp, int(big.get("file_size") or 0)
+    return None
+
+
+def safe_name(name):
+    name = (name or "file").replace("/", "_").replace("\0", "").strip() or "file"
+    return name if name not in (".", "..") else "file"
+
+
+def register(app):
+    auth = nas.Auth()
+    app.nas_auth = auth
+
+    def nconf():
+        return app.conf.get("nas") or config.DEFAULTS["nas"]
+
+    def sess(ctx):
+        s = ctx.session().get("nas")
+        if not s or s["exp"] < time.time():
+            ctx.session()["nas"] = None
+            return None
+        s["exp"] = time.time() + int(nconf().get("session_minutes", 30)) * 60
+        return s
+
+    def login_screen(ctx, note=None):
+        pend = ctx.session().get("nas_pending")
+        lines = ["📁 <b>فایل‌های NAS</b>", "",
+                 "با یکی از کاربرهای همین سرور (همان که در SMB/OMV دارید) وارد شوید.",
+                 "هر کاری که می‌کنید با دسترسی همان کاربر انجام می‌شود.",
+                 "🔒 رمز هیچ‌جا ذخیره نمی‌شود و پیامش بلافاصله پاک می‌شود."]
+        if pend:
+            lines += ["", "📥 فایل منتظر: <b>%s</b>" % esc(pend["name"])]
+        if note:
+            lines = [note, ""] + lines
+        return Screen("\n".join(lines), [[Btn("🔐 ورود", "nas_login", style=SUCCESS)]], back=("menu", []))
+
+    def guard(ctx):
+        """The NAS session, or a Screen to show instead (login / owner only)."""
+        if not ctx.owner:
+            return None, Screen("🔒 فایل‌های NAS فقط برای مالک است.", back=("menu", []))
+        s = sess(ctx)
+        if not s:
+            return None, login_screen(ctx, "⌛ برای ادامه دوباره وارد شوید." if ctx.session().get("nas_was") else None)
+        return s, None
+
+    def where(path, lst=None):
+        sh = nas.share_of(path, lst)
+        if not sh:
+            return None, None, None
+        rel = os.path.relpath(os.path.realpath(path), os.path.realpath(sh[1]))
+        return sh[0], sh[1], "" if rel == "." else rel
+
+    def title(path):
+        name, root, rel = where(path)
+        return "📁 <b>%s</b>%s" % (esc(name or "?"), (" / " + esc(rel.replace("/", " / "))) if rel else "")
+
+    # -------------------------------------------------------- log in / out
+    @app.action("nas")
+    def main(ctx, notice=None):
+        s, other = guard(ctx)
+        if other:
+            return other
+        lst = nas.shares()
+        lines = ["📁 <b>فایل‌های NAS</b> — 👤 %s" % esc(s["user"]), "", "پوشه‌های اشتراکی:"]
+        rows = [[Btn("📁 %s" % n, "nas_ls", p, 0, style=PRIMARY)] for n, p in lst]
+        if not lst:
+            lines.append("هیچ پوشه‌ی اشتراکی پیدا نشد.")
+        if s.get("home") and os.path.isdir(s["home"]) and nas.share_of(s["home"], lst):
+            rows.append([Btn("🏠 پوشه‌ی خانه‌ی من", "nas_ls", s["home"], 0, style=PRIMARY)])
+        if s.get("last") and os.path.isdir(s["last"]):
+            rows.append([Btn("🕘 آخرین پوشه: %s" % os.path.basename(s["last"].rstrip("/")), "nas_ls", s["last"], 0, style=PRIMARY)])
+        rows.append([Btn("🚪 خروج از حساب", "nas_logout", style=PRIMARY)])
+        sc = Screen("\n".join(lines), rows, refresh=("nas", []), back=("menu", []))
+        sc.notice = notice
+        return sc
+
+    @app.action("nas_login", write=True, view=False)
+    def login(ctx):
+        return ctx.ask_text("nas_user", "👤 نام کاربری NAS را بفرستید:", back=("nas", []))
+
+    @app.text_input("nas_user")
+    def user_input(ctx, text, msg):
+        user = text.strip()
+        ctx.msg_id = None
+        if not user or len(user) > 32:
+            return login_screen(ctx, "❌ نام کاربری نامعتبر است.")
+        return ctx.ask_text("nas_pass", "🔑 رمز کاربر <b>%s</b> را بفرستید (پیام بلافاصله پاک می‌شود):" % esc(user), user,
+                            back=("nas", []))
+
+    @app.text_input("nas_pass")
+    def pass_input(ctx, text, msg, user):
+        app.bot.delete(ctx.chat_id, msg.get("message_id"))
+        ctx.msg_id = None
+        try:
+            uid, gid, home = auth.check(ctx.chat_id, user, text)
+        except nas.NasError as e:
+            return login_screen(ctx, "❌ %s" % esc(e))
+        ctx.session()["nas"] = {"user": user, "uid": uid, "gid": gid, "home": home, "last": None,
+                                "exp": time.time() + int(nconf().get("session_minutes", 30)) * 60}
+        ctx.session()["nas_was"] = True
+        if ctx.session().get("nas_pending"):
+            return incoming_screen(ctx)
+        return main(ctx, "✅ وارد شدید")
+
+    @app.action("nas_logout", view=False)
+    def logout(ctx):
+        ctx.session()["nas"] = None
+        ctx.session()["nas_was"] = False
+        return login_screen(ctx, "🚪 از حساب NAS خارج شدید.")
+
+    # -------------------------------------------------------- browse
+    @app.action("nas_ls")
+    def ls(ctx, path, page=0, notice=None):
+        s, other = guard(ctx)
+        if other:
+            return other
+        name, root, rel = where(path)
+        if not root:
+            return main(ctx, "این مسیر جزو پوشه‌های اشتراکی نیست")
+        try:
+            r = nas.run_as(s, root, "list", path)
+        except nas.NasError as e:
+            return Screen("❌ %s: %s" % (title(path), esc(e)), back=("nas", []))
+        s["last"] = r["path"]
+        items = sorted(r["items"], key=lambda e: (not e["dir"], e["name"].lower()))
+        items = [e for e in items if not e["name"].startswith(".") or e["name"] in (".", "..")]
+        pages = max(1, (len(items) + PAGE - 1) // PAGE)
+        page = max(0, min(int(page), pages - 1))
+        dirs = sum(1 for e in items if e["dir"])
+        lines = [title(r["path"]), "%s پوشه · %s فایل%s" % (fa(dirs), fa(len(items) - dirs),
+                                                         "" if r["writable"] else " · 🔒 فقط خواندنی")]
+        rows = []
+        for e in items[page * PAGE:(page + 1) * PAGE]:
+            child = os.path.join(r["path"], e["name"])
+            if e["dir"]:
+                rows.append([Btn("📁 %s" % e["name"], "nas_ls", child, 0, style=PRIMARY)])
+            else:
+                rows.append([Btn("📄 %s · %s" % (e["name"], human(e["size"])), "nas_file", child, style=PRIMARY)])
+        if not items:
+            lines.append("این پوشه خالی است.")
+        rows.append(pager("nas_ls", [path], page, pages))
+        pend = ctx.session().get("nas_pending")
+        if pend and r["writable"]:
+            rows.append([Btn("📥 ذخیره‌ی «%s» اینجا" % pend["name"][:30], "nas_save_here", r["path"], style=SUCCESS)])
+        tools = []
+        if r["writable"]:
+            tools += [Btn("📤 آپلود اینجا", "nas_up", r["path"], style=SUCCESS), Btn("➕ پوشه‌ی تازه", "nas_mkdir", r["path"], style=SUCCESS)]
+        rows.append(tools)
+        up = os.path.dirname(r["path"])
+        nav = [Btn("🏠 پوشه‌ها", "nas", style=PRIMARY)]
+        if rel:
+            nav.insert(0, Btn("⬆️ بالا", "nas_ls", up, 0, style=PRIMARY))
+        rows.append(nav)
+        sc = Screen("\n".join(lines), rows, refresh=("nas_ls", [path, page]))
+        sc.notice = notice
+        return sc
+
+    @app.action("nas_file")
+    def file_page(ctx, path, notice=None):
+        s, other = guard(ctx)
+        if other:
+            return other
+        name, root, rel = where(path)
+        if not root:
+            return main(ctx)
+        try:
+            st = nas.run_as(s, root, "stat", path)
+        except nas.NasError as e:
+            return Screen("❌ %s" % esc(e), back=("nas_ls", [os.path.dirname(path), 0]))
+        lines = ["📄 <b>%s</b>" % esc(os.path.basename(path)), title(os.path.dirname(path)),
+                 "📦 حجم: %s" % human(st["size"]),
+                 "🕒 تغییر: %s" % time.strftime("%Y-%m-%d %H:%M", time.localtime(st["mtime"]))]
+        rows = []
+        if st.get("readable"):
+            rows.append([Btn("📥 بفرست به تلگرام", "nas_send", path, style=SUCCESS)])
+        if st.get("writable"):
+            rows.append([Btn("✏️ تغییر نام", "nas_rename", path, style=PRIMARY),
+                         Btn("🗑 حذف", "nas_del", path, confirm="فایل <b>%s</b> برای همیشه حذف شود؟" % esc(os.path.basename(path)))])
+        sc = Screen("\n".join(lines), rows, back=("nas_ls", [os.path.dirname(path), 0]))
+        sc.notice = notice
+        return sc
+
+    # -------------------------------------------------------- change things
+    @app.action("nas_mkdir", write=True, view=False)
+    def mkdir(ctx, d):
+        return ctx.ask_text("nas_mkdir", "➕ اسم پوشه‌ی تازه را بفرستید:", d, back=("nas_ls", [d, 0]))
+
+    @app.text_input("nas_mkdir")
+    def mkdir_input(ctx, text, msg, d):
+        s, other = guard(ctx)
+        ctx.msg_id = None
+        if other:
+            return other
+        try:
+            nas.run_as(s, where(d)[1], "mkdir", d, text.strip())
+        except nas.NasError as e:
+            return ls(ctx, d, 0, "❌ %s" % e)
+        log("nas: %s made folder %r in %s", s["user"], text.strip(), d)
+        return ls(ctx, d, 0, "✅ پوشه ساخته شد")
+
+    @app.action("nas_rename", write=True, view=False)
+    def rename(ctx, path):
+        return ctx.ask_text("nas_rename", "✏️ اسم تازه‌ی <b>%s</b> را بفرستید:" % esc(os.path.basename(path)), path,
+                            back=("nas_file", [path]))
+
+    @app.text_input("nas_rename")
+    def rename_input(ctx, text, msg, path):
+        s, other = guard(ctx)
+        ctx.msg_id = None
+        if other:
+            return other
+        try:
+            r = nas.run_as(s, where(path)[1], "rename", path, text.strip())
+        except nas.NasError as e:
+            return file_page(ctx, path, "❌ %s" % e)
+        log("nas: %s renamed %s", s["user"], path)
+        return file_page(ctx, r["path"], "✅ اسم عوض شد")
+
+    @app.action("nas_del", write=True, steps=1, view=False)
+    def delete(ctx, path):
+        s, other = guard(ctx)
+        if other:
+            return other
+        try:
+            nas.run_as(s, where(path)[1], "delete", path)
+        except nas.NasError as e:
+            return file_page(ctx, path, "❌ %s" % e)
+        log("nas: %s deleted %s", s["user"], path)
+        return ls(ctx, os.path.dirname(path), 0, "🗑 حذف شد")
+
+    # -------------------------------------------------------- NAS -> Telegram
+    @app.action("nas_send", write=True, view=False)
+    def send(ctx, path):
+        s, other = guard(ctx)
+        if other:
+            return other
+        root = where(path)[1]
+        try:
+            st = nas.run_as(s, root, "stat", path)
+        except nas.NasError as e:
+            return file_page(ctx, path, "❌ %s" % e)
+        if st["size"] > 2 * 1024 ** 3:
+            return file_page(ctx, path, "❌ بیشتر از ۲ گیگ است؛ از SMB بردارید")
+        ctx.answer("📤 در حال فرستادن…")
+        threading.Thread(target=send_job, args=(ctx.chat_id, dict(s), root, path, st["size"]), daemon=True).start()
+        return None
+
+    def send_job(chat_id, s, root, path, size):
+        name = os.path.basename(path)
+        os.makedirs(config.TMP, exist_ok=True)
+        tmp = os.path.join(config.TMP, "nas-%d-%d" % (chat_id, int(time.time() * 1000)))
+        status = None
+        try:
+            status = app.bot.send(chat_id, "📤 <b>%s</b> (%s) — آماده‌سازی…" % (esc(name), human(size)))
+            with open(os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600), "w+b") as out:
+                nas.run_as(s, root, "get", path, stdout=out, timeout=1800)
+            piece = int(nconf().get("send_piece_mb", 45)) * 1024 * 1024
+            total = os.path.getsize(tmp)
+            parts = max(1, (total + piece - 1) // piece)
+            for i in range(parts):
+                off = i * piece
+                fname = name if parts == 1 else "%s.part%02d" % (name, i + 1)
+                cap = "📁 %s" % esc(name) + ("" if parts == 1 else " — تکه‌ی %s از %s" % (fa(i + 1), fa(parts)))
+                for attempt in range(4):
+                    try:
+                        app.bot.send_file("sendDocument", "document", chat_id, fname, path=tmp, offset=off,
+                                          length=min(piece, total - off), caption=cap)
+                        break
+                    except (OSError, tg.TelegramError) as e:
+                        if attempt == 3:
+                            raise
+                        log("nas send %s: %s (again)", fname, e)
+                        time.sleep(3 * (attempt + 1))
+                if status and parts > 1:
+                    app.bot.edit(chat_id, status["message_id"], "📤 <b>%s</b>: %s از %s تکه فرستاده شد" % (esc(name), fa(i + 1), fa(parts)))
+            if parts > 1:
+                app.bot.send(chat_id, "🧩 «%s» در %s تکه آمد. برای یکی کردن: <code>cat \"%s\".part* &gt; \"%s\"</code> "
+                             "(ویندوز: <code>copy /b \"%s.part01\"+\"%s.part02\"… \"%s\"</code>)" % (
+                                 esc(name), fa(parts), esc(name), esc(name), esc(name), esc(name), esc(name)))
+            if status:
+                app.bot.delete(chat_id, status["message_id"])
+            log("nas: %s sent %s (%d bytes) to chat %s", s["user"], path, total, chat_id)
+        except (nas.NasError, OSError, tg.TelegramError) as e:
+            app.bot.send(chat_id, "❌ فرستادن «%s» نشد: %s" % (esc(name), esc(e)))
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    # -------------------------------------------------------- Telegram -> NAS
+    @app.action("nas_up", write=True, view=False)
+    def upload(ctx, d, notice=None):
+        s, other = guard(ctx)
+        if other:
+            return other
+        ctx.session()["input"] = {"kind": "nas_up", "args": [d], "exp": time.time() + UP_TTL}
+        lim = int(nconf().get("max_upload_mb", 20))
+        sc = Screen("📤 <b>آپلود به</b> %s\n\nهر چند فایل که می‌خواهید بفرستید (سند، عکس، ویدیو، صدا). هر کدام همین‌جا "
+                    "ذخیره می‌شود.\n⚠️ تلگرام به ربات‌ها فقط فایل تا %s مگ می‌دهد؛ بزرگ‌تر را با SMB بریزید.\n"
+                    "💡 عکس را «به صورت فایل» بفرستید تا کیفیتش کم نشود." % (title(d), fa(lim)),
+                    [[Btn("✅ تمام", "nas_ls", d, 0, style=SUCCESS)]])
+        sc.notice = notice
+        return sc
+
+    @app.text_input("nas_up")
+    def up_input(ctx, text, msg, d):
+        s, other = guard(ctx)
+        if other:
+            ctx.msg_id = None
+            return other
+        ctx.session()["input"] = {"kind": "nas_up", "args": [d], "exp": time.time() + UP_TTL}
+        f = incoming_file(msg)
+        if not f:
+            app.bot.send(ctx.chat_id, "📎 یک فایل بفرستید (یا «✅ تمام» را بزنید).")
+            return None
+        start_save(ctx.chat_id, dict(s), d, f)
+        return None
+
+    def start_save(chat_id, s, d, f):
+        threading.Thread(target=save_job, args=(chat_id, s, d, f), daemon=True).start()
+
+    def save_job(chat_id, s, d, f):
+        file_id, name, size = f
+        name = safe_name(name)
+        lim = int(nconf().get("max_upload_mb", 20)) * 1024 * 1024
+        if size and size > lim:
+            app.bot.send(chat_id, "❌ «%s» %s است؛ تلگرام فایل بیشتر از %s مگ را به ربات نمی‌دهد. با SMB بریزید." % (
+                esc(name), human(size), fa(lim // 1048576)))
+            return
+        os.makedirs(config.TMP, exist_ok=True)
+        tmp = os.path.join(config.TMP, "up-%d-%d" % (chat_id, int(time.time() * 1000)))
+        status = None
+        try:
+            status = app.bot.send(chat_id, "⏳ ذخیره‌ی «%s»…" % esc(name))
+            app.bot.download(file_id, tmp, limit=lim)
+            os.chmod(tmp, 0o600)
+            with open(tmp, "rb") as src:
+                r = nas.run_as(s, nas.share_of(d)[1], "put", d, name, stdin=src, timeout=1800)
+            text = "✅ <b>%s</b> ذخیره شد (%s)\n%s" % (esc(r["name"]), human(r["size"]), title(d))
+            if r["name"] != name:
+                text += "\n(اسم «%s» بود، پس با اسم تازه ذخیره شد)" % esc(name)
+            app.bot.edit(chat_id, status["message_id"], text)
+            log("nas: %s uploaded %s (%d bytes) into %s", s["user"], r["name"], r["size"], d)
+        except (nas.NasError, OSError, tg.TelegramError) as e:
+            msg = "❌ «%s» ذخیره نشد: %s" % (esc(name), esc(e))
+            if status:
+                app.bot.edit(chat_id, status["message_id"], msg)
+            else:
+                app.bot.send(chat_id, msg)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    def incoming_screen(ctx):
+        pend = ctx.session().get("nas_pending")
+        s = sess(ctx)
+        lines = ["📥 فایل <b>%s</b> (%s) رسید. کجا در NAS ذخیره شود؟" % (esc(pend["name"]), human(pend["size"]))]
+        rows = []
+        if s and s.get("last"):
+            rows.append([Btn("💾 در «%s»" % os.path.basename(s["last"].rstrip("/")), "nas_save_here", s["last"], style=SUCCESS)])
+        rows.append([Btn("📁 انتخاب پوشه", "nas", style=PRIMARY), Btn("✖️ ذخیره نکن", "nas_forget", style=PRIMARY)])
+        return Screen("\n".join(lines), rows)
+
+    @app.action("nas_incoming", view=False)
+    def incoming(ctx, file_id, name, size):
+        if not ctx.owner:
+            return None
+        ctx.session()["nas_pending"] = {"file_id": file_id, "name": safe_name(name), "size": int(size or 0)}
+        if not sess(ctx):
+            return login_screen(ctx, "📥 فایل <b>%s</b> رسید. برای ذخیره در NAS اول وارد شوید." % esc(name))
+        return incoming_screen(ctx)
+
+    @app.action("nas_save_here", write=True, view=False)
+    def save_here(ctx, d):
+        s, other = guard(ctx)
+        if other:
+            return other
+        pend = ctx.session().pop("nas_pending", None)
+        if not pend:
+            return ls(ctx, d, 0, "فایلی منتظر نیست")
+        start_save(ctx.chat_id, dict(s), d, (pend["file_id"], pend["name"], pend["size"]))
+        return ls(ctx, d, 0, "⏳ در حال ذخیره…")
+
+    @app.action("nas_forget", view=False)
+    def forget(ctx):
+        ctx.session().pop("nas_pending", None)
+        return Screen("باشه، ذخیره نشد.", back=("menu", []))
+ERISBOT_EOF_s_files_py
   put_file "$STAGE/erisbot/s_main.py" 0644 << 'ERISBOT_EOF_s_main_py'
 """Main menu, dashboard, confirmations, server power and settings."""
 import os
 import re
 import time
 
-from . import config, eris, fand, marzban, net, system, tg
+from . import alerts, config, eris, fand, marzban, net, system, tg
 from .ui import DANGER, PRIMARY, SUCCESS, Btn, Screen
 from .util import ago, bar, duration, esc, fa, human, log
 
@@ -4156,7 +5767,9 @@ def menu_screen(app, ctx):
     if eris.available():
         btns.append(Btn("🛡 فایروال", "fw", style=PRIMARY))
         btns.append(Btn("💾 بکاپ", "bk", style=PRIMARY))
-    btns += [Btn("🔔 هشدارها", "al", style=PRIMARY), Btn("🌀 فن و عملکرد", "fan", style=PRIMARY),
+    btns += [Btn("🤖 هوش مصنوعی", "ai", style=PRIMARY), Btn("📁 فایل‌های NAS", "nas", style=PRIMARY),
+             Btn("🌤 آب و هوا", "wx", style=PRIMARY),
+             Btn("🔔 هشدارها", "al", style=PRIMARY), Btn("🌀 فن و عملکرد", "fan", style=PRIMARY),
              Btn("🔁 سرور", "server", style=PRIMARY), Btn("⚙️ تنظیمات", "set", style=PRIMARY)]
     rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
     return Screen("\n".join(lines), rows, refresh=("menu", []))
@@ -4260,11 +5873,12 @@ def register(app):
                  "🔑 رمز بکاپ: %s" % ("تنظیم شده ✅" if os.path.isfile(pw) and os.path.getsize(pw) > 0 else "❌ تنظیم نشده"),
                  "🗓 گزارش روزانه: %s" % (("ساعت " + dr.get("at", "09:00")) if dr.get("enabled") else "خاموش"),
                  "🎨 رنگ دکمه‌ها: %s" % colors,
-                 "🧩 اندازه‌ی هر تکه‌ی ارسال: %s MB" % fa(c.get("part_size_mb", 45))]
+                 "🧩 اندازه‌ی هر تکه‌ی ارسال: %s MB" % fa(c.get("part_size_mb", 45)),
+                 "📍 IP ثابت: %s" % (("<code>%s</code>" % esc(alerts.static_ip(c))) if alerts.static_ip(c) else "تنظیم نشده")]
         rows = [[Btn("🌐 پروکسی", "set_proxy", style=PRIMARY), Btn("👥 chat IDها", "set_chats", style=PRIMARY)],
                 [Btn("💾 ارسال بکاپ", "set_send", style=PRIMARY), Btn("🔑 رمز بکاپ", "set_pw", style=PRIMARY)],
                 [Btn("🗓 گزارش روزانه", "set_report", style=PRIMARY), Btn("🎨 رنگ دکمه‌ها", "set_colors", style=PRIMARY)],
-                [Btn("🧩 اندازه‌ی تکه", "set_piece", style=PRIMARY)]]
+                [Btn("🧩 اندازه‌ی تکه", "set_piece", style=PRIMARY), Btn("📍 IP عمومی", "set_ip", style=PRIMARY)]]
         return Screen("\n".join(lines), rows, refresh=("set", []), back=("menu", []))
 
     @app.action("set_proxy")
@@ -4494,6 +6108,54 @@ def register(app):
                 app.state.set("styles_refused", False)
         return set_colors(ctx)
 
+    # -------------------------------------------------------- public IP (static, the alert)
+    @app.action("set_ip")
+    def set_ip(ctx, check=False, notice=None):
+        c = app.conf
+        st = alerts.static_ip(c)
+        lines = ["📍 <b>IP عمومی</b>",
+                 "IP از چند سرویس پرسیده می‌شود و فقط وقتی حساب است که دست‌کم دو تا یکی بگویند؛ تغییر هم فقط "
+                 "بعد از دو بار پشت هم اعلام می‌شود (جواب‌های پرت حساب نمی‌شوند).",
+                 "IP ثابت: %s" % ("<code>%s</code> — هشدار فقط وقتی IP چیز دیگری باشد" % esc(st) if st else "تنظیم نشده")]
+        found = None
+        if check:
+            found, answers = alerts.consensus_ip(alerts.public_ip_urls(c))
+            lines += ["", "🧪 <b>همین الان</b>"]
+            for u, ip in answers:
+                lines.append("• %s: %s" % (esc(u.split("//", 1)[-1].split("/", 1)[0]), "<code>%s</code>" % esc(ip) if ip else "❌"))
+            lines.append("نتیجه: %s" % ("<code>%s</code>" % esc(found) if found else "توافقی نشد"))
+        rows = [[Btn("🧪 بررسی الان", "set_ip", True, style=PRIMARY)]]
+        if found and found != st:
+            rows.append([Btn("📌 %s را IP ثابت کن" % found, "ip_static", found, style=SUCCESS)])
+        rows.append([Btn("✏️ نوشتن IP ثابت", "ip_static_ask", style=PRIMARY)] +
+                    ([Btn("❌ بدون IP ثابت", "ip_static", "", style=PRIMARY)] if st else []))
+        s = Screen("\n".join(lines), rows, back=("set", []))
+        s.notice = notice
+        return s
+
+    @app.action("ip_static", write=True, view=False)
+    def ip_static(ctx, ip):
+        pi = dict(app.conf.get("public_ip") or {})
+        pi["static"] = ip
+        app.save_conf(public_ip=pi)
+        app.sources.st.update(ip_candidate=None, ip_streak=0)
+        log("static IP set to %r by chat %s", ip, ctx.chat_id)
+        return set_ip(ctx, False, "✅ IP ثابت: %s" % ip if ip else "IP ثابت برداشته شد")
+
+    @app.action("ip_static_ask", write=True, view=False)
+    def ip_static_ask(ctx):
+        return ctx.ask_text("ip_static", "✏️ IP ثابت سرور را بفرستید (مثلاً <code>203.0.113.7</code>):", back=("set_ip", []))
+
+    @app.text_input("ip_static")
+    def ip_static_input(ctx, text, msg):
+        import ipaddress
+        try:
+            ip = str(ipaddress.ip_address(text.strip()))
+        except ValueError:
+            return Screen("❌ IP نامعتبر است.", back=("set_ip", []))
+        ctx.msg_id = None
+        return ip_static(ctx, ip)
+
     @app.action("set_piece")
     def set_piece(ctx):
         cur = int(app.conf.get("part_size_mb", 45))
@@ -4531,9 +6193,13 @@ ERISBOT_EOF_s_main_py
 import re
 import time
 
-from . import marzban, qr
+from . import config, marzban, qr
 from .ui import DANGER, PRIMARY, SUCCESS, Btn, Screen, pager
-from .util import ago, esc, fa, human, log, until
+from .util import ago, esc, fa, fmt_num, human, log, parse_amount, until
+
+
+def config_defaults():
+    return config.DEFAULTS["mz_presets"]
 
 PAGE = 8
 STATUS_FA = {"active": "🟢 فعال", "disabled": "⚪️ غیرفعال", "limited": "🟠 محدود (حجم)", "expired": "🔴 منقضی",
@@ -4643,6 +6309,7 @@ def register(app):
                  Btn("⏳ +۹۰ روز", "mz_ext", name, 90, style=SUCCESS)],
                 [Btn("📦 +۱۰ گیگ", "mz_gb", name, 10, style=SUCCESS), Btn("📦 +۵۰ گیگ", "mz_gb", name, 50, style=SUCCESS),
                  Btn("📦 +۱۰۰ گیگ", "mz_gb", name, 100, style=SUCCESS)],
+                [Btn("✍️ روز دلخواه", "mz_ext_ask", name, style=SUCCESS), Btn("✍️ حجم دلخواه", "mz_gb_ask", name, style=SUCCESS)],
                 [Btn("♻️ ریست مصرف", "mz_reset", name, confirm="مصرف <b>%s</b> صفر شود؟ (برگشت ندارد)" % esc(name))]]
         if u.get("status") == "disabled":
             rows.append([Btn("▶️ فعال کردن", "mz_enable", name, style=SUCCESS)])
@@ -4692,6 +6359,66 @@ def register(app):
         log("user %s +%d GB by chat %s", name, gb, ctx.chat_id)
         return user_page(ctx, name, "✅ %s گیگ اضافه شد" % fa(gb) if done else "حجم این کاربر نامحدود است")
 
+    # -------------------------------------------------------- any number of days / GB for one user
+    @app.action("mz_ext_ask", write=True, view=False)
+    def ext_ask(ctx, name):
+        return ctx.ask_text("mz_ext_in", "⏳ <b>%s</b>: چند روز اضافه شود؟\nمثال: <code>12</code> · <code>2 ماه</code> · "
+                            "<code>6 ساعت</code> · منفی کم می‌کند: <code>-3</code>\n<code>0</code> = انقضا برداشته شود "
+                            "(نامحدود)\nاگر الان نامحدود است، از همین حالا حساب می‌شود." % esc(name), name, back=("mz_user", [name]))
+
+    @app.text_input("mz_ext_in")
+    def ext_input(ctx, text, msg, name):
+        days = parse_amount(text, "days", allow_negative=True)
+        ctx.msg_id = None
+        if days is None:
+            return Screen("❌ «%s» عدد روز نیست." % esc(text[:30]), [[Btn("✍️ دوباره", "mz_ext_ask", name, style=SUCCESS)]],
+                          back=("mz_user", [name]))
+        u = mz.user(name)
+        if days == 0:
+            mz.modify(name, expire=0)
+            note = "♾ انقضا برداشته شد (نامحدود)"
+        elif not u.get("expire"):
+            if days < 0:
+                return user_page(ctx, name, "انقضای این کاربر نامحدود است؛ چیزی کم نشد")
+            mz.modify(name, expire=int(time.time() + days * 86400))
+            note = "⏳ انقضا: %s از الان" % days_text(days)
+        else:
+            mz.extend(name, days)
+            note = "⏳ %s %s" % (days_text(abs(days)), "اضافه شد" if days > 0 else "کم شد")
+        log("user %s expire %+.2f days by chat %s", name, days, ctx.chat_id)
+        return user_page(ctx, name, note)
+
+    @app.action("mz_gb_ask", write=True, view=False)
+    def gb_ask(ctx, name):
+        return ctx.ask_text("mz_gb_in", "📦 <b>%s</b>: چند گیگ اضافه شود؟\nمثال: <code>7</code> · <code>2.5</code> · "
+                            "<code>300 مگ</code> · منفی کم می‌کند: <code>-5</code>\n<code>0</code> = حجم نامحدود\n"
+                            "اگر الان نامحدود است، سقف = مصرف فعلی + این مقدار." % esc(name), name, back=("mz_user", [name]))
+
+    @app.text_input("mz_gb_in")
+    def gb_input(ctx, text, msg, name):
+        gb = parse_amount(text, "gb", allow_negative=True)
+        ctx.msg_id = None
+        if gb is None:
+            return Screen("❌ «%s» عدد حجم نیست." % esc(text[:30]), [[Btn("✍️ دوباره", "mz_gb_ask", name, style=SUCCESS)]],
+                          back=("mz_user", [name]))
+        u = mz.user(name)
+        if gb == 0:
+            mz.modify(name, data_limit=0)
+            note = "♾ حجم نامحدود شد"
+        elif not u.get("data_limit"):
+            if gb < 0:
+                return user_page(ctx, name, "حجم این کاربر نامحدود است؛ چیزی کم نشد")
+            mz.modify(name, data_limit=int((u.get("used_traffic") or 0) + gb * GB))
+            note = "📦 سقف: مصرف فعلی + %s" % gb_text(gb)
+        else:
+            new = int(u["data_limit"] + gb * GB)
+            if new <= 0:
+                return user_page(ctx, name, "❌ حجم کمتر از صفر می‌شد؛ چیزی تغییر نکرد")
+            mz.modify(name, data_limit=new)
+            note = "📦 %s %s" % (gb_text(abs(gb)), "اضافه شد" if gb > 0 else "کم شد")
+        log("user %s data %+.3f GB by chat %s", name, gb, ctx.chat_id)
+        return user_page(ctx, name, note)
+
     @app.action("mz_reset", write=True, steps=1, view=False)
     def reset(ctx, name):
         mz.reset(name)
@@ -4739,26 +6466,70 @@ def register(app):
         ctx.msg_id = None
         return step_data(ctx)
 
-    def step_data(ctx):
+    def presets(kind):
+        p = (app.conf.get("mz_presets") or {}).get(kind) or config_defaults()[kind]
+        return [x for x in p if isinstance(x, (int, float)) and x > 0][:8]
+
+    def arm(ctx, kind, *args):
+        """Take the next text message as the answer to this step (the buttons still work)."""
+        ctx.session()["input"] = {"kind": kind, "args": list(args), "exp": time.time() + 600}
+
+    def gb_text(gb):
+        return "%s گیگ" % fmt_num(gb) if gb else "نامحدود"
+
+    def days_text(days):
+        if not days:
+            return "بی‌نهایت"
+        if days < 1:
+            return "%s ساعت" % fmt_num(round(days * 24, 2))
+        return "%s روز" % fmt_num(days)
+
+    def preset_rows(action, values, label, unlimited):
+        btns = [Btn(label(v), action, v, style=SUCCESS) for v in values] + [Btn(unlimited, action, 0, style=SUCCESS)]
+        return [btns[i:i + 3] for i in range(0, len(btns), 3)]
+
+    def step_data(ctx, error=None):
         w = wiz(ctx)
-        rows = [[Btn("%s گیگ" % fa(g), "mz_new_gb", g, style=SUCCESS) for g in (10, 20, 50)],
-                [Btn("%s گیگ" % fa(g), "mz_new_gb", g, style=SUCCESS) for g in (100, 200)] + [Btn("♾ نامحدود", "mz_new_gb", 0, style=SUCCESS)],
-                [Btn("✖️ لغو", "mz", style=PRIMARY)]]
-        return Screen("➕ <b>ساخت کاربر %s</b> — قدم ۲ از ۴\nحجم:" % esc(w.get("name")), rows)
+        arm(ctx, "mz_new_gb_in")
+        rows = preset_rows("mz_new_gb", presets("gb"), gb_text, "♾ نامحدود") + [[Btn("✖️ لغو", "mz", style=PRIMARY)]]
+        return Screen("%s➕ <b>ساخت کاربر %s</b> — قدم ۲ از ۴\n📦 <b>حجم</b>: یکی از دکمه‌ها، یا هر عددی بفرستید.\n"
+                      "مثال: <code>15</code> (گیگ) · <code>2.5</code> · <code>500 مگ</code> · <code>1 ترا</code> · "
+                      "<code>0</code> = نامحدود" % (error and error + "\n\n" or "", esc(w.get("name"))), rows)
+
+    @app.text_input("mz_new_gb_in")
+    def new_gb_input(ctx, text, msg):
+        gb = parse_amount(text, "gb")
+        ctx.msg_id = None
+        if gb is None or gb < 0:
+            return step_data(ctx, "❌ «%s» عدد حجم نیست." % esc(text[:30]))
+        return new_gb(ctx, gb)
 
     @app.action("mz_new_gb", write=True, view=False)
-    def new_gb(ctx, gb):
-        wiz(ctx)["gb"] = int(gb)
+    def new_gb(ctx, gb, error=None):
         w = wiz(ctx)
-        rows = [[Btn("%s روز" % fa(d), "mz_new_days", d, style=SUCCESS) for d in (7, 30, 60)],
-                [Btn("%s روز" % fa(d), "mz_new_days", d, style=SUCCESS) for d in (90, 180)] + [Btn("♾ بی‌نهایت", "mz_new_days", 0, style=SUCCESS)],
-                [Btn("✖️ لغو", "mz", style=PRIMARY)]]
-        return Screen("➕ <b>ساخت کاربر %s</b> — قدم ۳ از ۴\nحجم: %s\nمدت:" % (esc(w.get("name")), "%s گیگ" % fa(gb) if gb else "نامحدود"), rows)
+        if "name" not in w:
+            return Screen("⌛ این ساخت منقضی شده؛ دوباره شروع کنید.", back=("mz", []))
+        w["gb"] = float(gb)
+        arm(ctx, "mz_new_days_in")
+        rows = preset_rows("mz_new_days", presets("days"), days_text, "♾ بی‌نهایت") + [[Btn("✖️ لغو", "mz", style=PRIMARY)]]
+        return Screen("%s➕ <b>ساخت کاربر %s</b> — قدم ۳ از ۴\nحجم: %s\n⏳ <b>مدت</b>: یکی از دکمه‌ها، یا هر عددی بفرستید.\n"
+                      "مثال: <code>45</code> (روز) · <code>2 ماه</code> · <code>12 ساعت</code> · <code>1 سال</code> · "
+                      "<code>0</code> = بی‌نهایت" % (error and error + "\n\n" or "", esc(w.get("name")), gb_text(w["gb"])), rows)
+
+    @app.text_input("mz_new_days_in")
+    def new_days_input(ctx, text, msg):
+        days = parse_amount(text, "days")
+        ctx.msg_id = None
+        if days is None or days < 0:
+            return new_gb(ctx, wiz(ctx).get("gb", 0), "❌ «%s» عدد روز نیست." % esc(text[:30]))
+        return new_days(ctx, days)
 
     @app.action("mz_new_days", write=True, view=False)
     def new_days(ctx, days):
         w = wiz(ctx)
-        w["days"] = int(days)
+        if "name" not in w or "gb" not in w:
+            return Screen("⌛ این ساخت منقضی شده؛ دوباره شروع کنید.", back=("mz", []))
+        w["days"] = float(days)
         inb = mz.inbounds()
         w["all"] = {p: [i["tag"] for i in lst] for p, lst in inb.items() if lst}
         w["sel"] = {p: list(t) for p, t in w["all"].items() if p == "vless"} or {p: list(t) for p, t in w["all"].items()}
@@ -4775,8 +6546,7 @@ def register(app):
                 rows.append([Btn(("✅ " if on else "⬜️ ") + "%s (%s)" % (t, p), "mz_new_inb", p, t, style=SUCCESS if on else PRIMARY)])
         rows.append([Btn("✅ ساخت کاربر", "mz_new_go", style=SUCCESS), Btn("✖️ لغو", "mz", style=PRIMARY)])
         return Screen("➕ <b>ساخت کاربر %s</b> — قدم ۴ از ۴\nحجم: %s · مدت: %s\nاینباندها را انتخاب کنید:" % (
-            esc(w["name"]), "%s گیگ" % fa(w["gb"]) if w.get("gb") else "نامحدود",
-            "%s روز" % fa(w["days"]) if w.get("days") else "بی‌نهایت"), rows)
+            esc(w["name"]), gb_text(w.get("gb")), days_text(w.get("days"))), rows)
 
     @app.action("mz_new_inb", write=True, view=False)
     def new_inb(ctx, proto, tag):
@@ -4798,7 +6568,7 @@ def register(app):
             ctx.answer("حداقل یک اینباند انتخاب کنید.", alert=True)
             return step_inbounds(ctx)
         expire = int(time.time() + w["days"] * 86400) if w.get("days") else None
-        mz.create(w["name"], sel, expire=expire, data_limit=w["gb"] * GB if w.get("gb") else 0, note="eris-bot")
+        mz.create(w["name"], sel, expire=expire, data_limit=int(w["gb"] * GB) if w.get("gb") else 0, note="eris-bot")
         log("user %s created by chat %s", w["name"], ctx.chat_id)
         name = w["name"]
         ctx.session()["mz_new"] = {}
@@ -5055,14 +6825,146 @@ def register(app):
         log("eris fw confirm by chat %s: %d", ctx.chat_id, rc)
         return fw_screen(eris.fw_status(), ("✅ نگه داشته شد." if rc == 0 else "❌ ") + "\n<pre>%s</pre>" % esc(clip(out, 1000)))
 ERISBOT_EOF_s_ops_py
+  put_file "$STAGE/erisbot/s_weather.py" 0644 << 'ERISBOT_EOF_s_weather_py'
+"""🌤 Weather: the saved city (or any other), and an optional daily message at a set time."""
+import time
+
+from . import config, weather
+from .ui import PRIMARY, SUCCESS, Btn, Screen
+from .util import esc, fa, log
+
+
+def register(app):
+    def wconf():
+        return dict(config.DEFAULTS["weather"], **(app.conf.get("weather") or {}))
+
+    def routes():
+        return [None] + [p for p in app.conf.get("proxy_list") or [] if p]
+
+    def report(city, lat, lon):
+        return weather.render(city, weather.forecast(lat, lon, routes()))
+
+    @app.action("wx")
+    def main(ctx, notice=None):
+        w = wconf()
+        if w.get("lat") is None:
+            return ask_city(ctx, first=True)
+        try:
+            text = report(w["city"], w["lat"], w["lon"])
+        except weather.WeatherError as e:
+            text = "❌ %s" % esc(e)
+        daily = "روشن، ساعت %s" % fa(w["at"]) if w.get("daily") else "خاموش"
+        rows = [[Btn("📍 شهر دیگر", "wx_city", style=PRIMARY), Btn("🗓 ارسال روزانه: %s" % daily, "wx_daily", style=PRIMARY)]]
+        sc = Screen(text + "\n\n<i>Open-Meteo · %s</i>" % time.strftime("%H:%M"), rows, refresh=("wx", []), back=("menu", []))
+        sc.notice = notice
+        return sc
+
+    @app.action("wx_city", view=False)
+    def ask_city(ctx, first=False):
+        return ctx.ask_text("wx_city", "%s📍 اسم شهر را بفرستید (فارسی یا انگلیسی)، یا از 📎 «Location» موقعیتتان را بفرستید." % (
+            "🌤 <b>آب و هوا</b>\nاول شهرتان را بگویید.\n\n" if first else ""), back=("wx", []) if not first else ("menu", []))
+
+    @app.text_input("wx_city", write=False)
+    def city_input(ctx, text, msg):
+        ctx.msg_id = None
+        loc = msg.get("location")
+        if loc:
+            return pick(ctx, "موقعیت من", loc["latitude"], loc["longitude"], save=ctx.owner)
+        try:
+            res = weather.search(text, routes())
+        except weather.WeatherError as e:
+            return Screen("❌ %s" % esc(e), [[Btn("✍️ دوباره", "wx_city", style=SUCCESS)]], back=("menu", []))
+        if not res:
+            return Screen("❌ شهری با اسم «%s» پیدا نشد." % esc(text[:40]), [[Btn("✍️ دوباره", "wx_city", style=SUCCESS)]],
+                          back=("menu", []))
+        if len(res) == 1:
+            return pick(ctx, *res[0][:3], save=ctx.owner)
+        rows = [[Btn(label, "wx_pick", label, lat, lon, style=PRIMARY)] for label, lat, lon, _ in res]
+        return Screen("📍 کدام یکی؟", rows, back=("wx", []))
+
+    @app.action("wx_pick", view=False)
+    def pick_btn(ctx, label, lat, lon):
+        return pick(ctx, label, lat, lon, save=ctx.owner)
+
+    def pick(ctx, label, lat, lon, save=True):
+        if save:
+            w = wconf()
+            w.update(city=label, lat=float(lat), lon=float(lon))
+            app.save_conf(weather=w)
+            log("weather city set to %s by chat %s", label, ctx.chat_id)
+            return main(ctx, "📍 %s ذخیره شد" % label)
+        try:
+            return Screen(report(label, float(lat), float(lon)), back=("wx", []))
+        except weather.WeatherError as e:
+            return Screen("❌ %s" % esc(e), back=("wx", []))
+
+    @app.action("wx_daily")
+    def daily(ctx):
+        w = wconf()
+        on = w.get("daily")
+        rows = [[Btn("⏹ خاموش کن" if on else "✅ روشن کن", "wx_daily_toggle", style=SUCCESS)],
+                [Btn(("✅ " if w.get("at") == h else "") + fa(h), "wx_daily_at", h, style=PRIMARY)
+                 for h in ("06:30", "07:30", "08:00", "09:00")],
+                [Btn("✏️ ساعت دیگر", "wx_daily_ask", style=PRIMARY)]]
+        return Screen("🗓 <b>آب و هوای روزانه</b>\nهر روز در ساعت انتخابی آب و هوای %s فرستاده می‌شود.\nوضعیت: %s · ساعت %s" % (
+            esc(w.get("city") or "—"), "روشن" if on else "خاموش", fa(w.get("at"))), rows, back=("wx", []))
+
+    def save_w(**kw):
+        w = wconf()
+        w.update(kw)
+        app.save_conf(weather=w)
+
+    @app.action("wx_daily_toggle", write=True, view=False)
+    def daily_toggle(ctx):
+        save_w(daily=not wconf().get("daily"))
+        return daily(ctx)
+
+    @app.action("wx_daily_at", write=True, view=False)
+    def daily_at(ctx, at):
+        if config.HHMM_RX.match(at):
+            save_w(at=at)
+        return daily(ctx)
+
+    @app.action("wx_daily_ask", write=True, view=False)
+    def daily_ask(ctx):
+        return ctx.ask_text("wx_at", "🕒 ساعت را به شکل HH:MM بفرستید (مثلاً 07:15):", back=("wx_daily", []))
+
+    @app.text_input("wx_at")
+    def at_input(ctx, text, msg):
+        t = text.strip().translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789"))
+        if not config.HHMM_RX.match(t):
+            return Screen("❌ به شکل HH:MM بفرستید.", back=("wx_daily", []))
+        save_w(at=t)
+        return daily(ctx)
+
+    def tick(now=None):
+        """Called by the schedule loop: the daily weather message, once a day in a 30-minute window."""
+        w = wconf()
+        if not w.get("daily") or w.get("lat") is None or not config.HHMM_RX.match(w.get("at") or ""):
+            return False
+        now = now or time.time()
+        lt = time.localtime(now)
+        start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, int(w["at"][:2]), int(w["at"][3:]), 0, 0, 0, -1))
+        day = time.strftime("%Y-%m-%d", lt)
+        if not (start <= now < start + 1800) or app.state.get("weather_day") == day:
+            return False
+        app.state.set("weather_day", day)
+        try:
+            app.notify(report(w["city"], w["lat"], w["lon"]))
+        except weather.WeatherError as e:
+            log("daily weather: %s", e)
+        return True
+
+    app.weather_tick = tick
+ERISBOT_EOF_s_weather_py
   put_file "$STAGE/erisbot/screens.py" 0644 << 'ERISBOT_EOF_screens_py'
 """All screens of the bot (registered on the App)."""
-from . import s_alerts, s_backup, s_fans, s_main, s_mz, s_ops
+from . import s_ai, s_alerts, s_backup, s_fans, s_files, s_main, s_mz, s_ops, s_weather
 from .s_main import dashboard_text  # noqa: F401  (daily report)
 
 
 def register(app):
-    for m in (s_main, s_mz, s_ops, s_backup, s_alerts, s_fans):
+    for m in (s_main, s_mz, s_ops, s_backup, s_alerts, s_fans, s_ai, s_files, s_weather):
         m.register(app)
 
 
@@ -5699,6 +7601,21 @@ def strip_styles(obj):
     return out, found[0]
 
 
+def style_refusal(desc):
+    """Could this 400 be Telegram refusing the buttons' "style" field? Never for an edit that changes
+    nothing ("message is not modified", e.g. a button pressed twice): sending the same screen without
+    colours would "work" and wrongly turn colours off for good."""
+    d = (desc or "").lower()
+    if "not modified" in d or "message to edit not found" in d or "query is too old" in d:
+        return False
+    return "button" in d or "style" in d or "keyboard" in d or "reply markup" in d or "reply_markup" in d
+
+
+def stale_refusal(reason):
+    """A colour refusal saved by an older version that was really an unchanged edit."""
+    return not style_refusal(reason)
+
+
 class Router:
     """The way to Telegram. proxy = off | auto | URL; auto tries direct first, then proxy_list in order."""
 
@@ -5877,7 +7794,7 @@ class Bot:
                 self.sleep(min(10, delay))
                 delay *= 2
                 continue
-            if code == 400 and "reply_markup" in params:
+            if code == 400 and "reply_markup" in params and style_refusal(desc):
                 plain, had = strip_styles(params["reply_markup"])
                 if had:
                     try:
@@ -5973,6 +7890,51 @@ class Bot:
                 continue
             raise TelegramError(code, res.get("description", ""))
         raise TelegramError(429, "too many requests")
+
+    # ------------------------------------------------------------ downloads (a file someone sent)
+    def download(self, file_id, dest, limit=20 * 1024 * 1024, progress=None):
+        """Save a file sent to the bot (getFile + /file/bot<token>/<path>) to `dest`; returns its size.
+        The Bot API serves files up to 20 MB."""
+        info = self.call("getFile", {"file_id": file_id}, timeout=30)
+        path = (info or {}).get("file_path")
+        if not path:
+            raise TelegramError(400, "Telegram gave no file path (files over 20 MB cannot be downloaded by bots)")
+        size = int((info or {}).get("file_size") or 0)
+        if size and size > limit:
+            raise TelegramError(400, "file too big")
+        last = None
+        for _ in range(4):
+            route = self.route()
+            c = net.Connection(self.base(), route, 15.0)
+            try:
+                c.request("GET", "%s/file/bot%s/%s" % (self._path_prefix(), self.conf["token"], path))
+                c.sock.settimeout(120)
+                r = c.getresponse()
+                if r.status != 200:
+                    raise TelegramError(r.status, "download failed (HTTP %d)" % r.status)
+                done = 0
+                tmp = dest + ".part"
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = r.read(65536)
+                        if not chunk:
+                            break
+                        done += len(chunk)
+                        if done > limit:
+                            raise TelegramError(400, "file too big")
+                        f.write(chunk)
+                        if progress:
+                            progress(done, size)
+                os.replace(tmp, dest)
+                return done
+            except NET_ERRORS as e:
+                last = e
+                self.router.failed(route)
+            finally:
+                c.close()
+                if os.path.exists(dest + ".part"):
+                    os.remove(dest + ".part")
+        raise last or OSError("download failed")
 
     # ------------------------------------------------------------ helpers
     def get_me(self):
@@ -6163,6 +8125,49 @@ def fa(x):
     return str(x).translate(_FA)
 
 
+_EN = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩٫،", "01234567890123456789.,")
+_NUM_RX = re.compile(r"^([+-]?)\s*(\d+(?:[.,]\d+)?|[.,]\d+)\s*(.*)$")
+UNLIMITED_WORDS = ("نامحدود", "بی‌نهایت", "بینهایت", "بی نهایت", "inf", "unlimited", "∞", "♾")
+
+
+def fmt_num(x):
+    """12 -> ۱۲, 1.5 -> ۱.۵ (no trailing .0)."""
+    x = float(x)
+    s = ("%d" % x) if x == int(x) else ("%.2f" % x).rstrip("0").rstrip(".")
+    return fa(s)
+
+
+def parse_amount(text, kind, allow_negative=False):
+    """A number the user typed, with an optional unit. kind "gb": GB (or MB/TB units); kind "days": days
+    (or hour/week/month/year units). Persian/Arabic digits and the Persian decimal point work.
+    Returns a float (0 = unlimited) or None when it cannot be read."""
+    t = (text or "").strip().translate(_EN).lower().replace("‌", " ")
+    if any(w.replace("‌", " ") == t for w in UNLIMITED_WORDS):
+        return 0.0
+    m = _NUM_RX.match(t)
+    if not m:
+        return None
+    sign, num, unit = m.group(1), m.group(2).replace(",", "."), m.group(3).strip()
+    value = float(num)
+    if kind == "gb":
+        units = {"": 1, "g": 1, "gb": 1, "گیگ": 1, "گیگابایت": 1, "گ": 1,
+                 "m": 1 / 1024.0, "mb": 1 / 1024.0, "مگ": 1 / 1024.0, "مگابایت": 1 / 1024.0,
+                 "t": 1024, "tb": 1024, "ترا": 1024, "ترابایت": 1024}
+    else:
+        units = {"": 1, "d": 1, "day": 1, "days": 1, "روز": 1, "h": 1 / 24.0, "hour": 1 / 24.0, "ساعت": 1 / 24.0,
+                 "w": 7, "week": 7, "هفته": 7, "month": 30, "ماه": 30, "y": 365, "year": 365, "سال": 365}
+    if unit not in units:
+        return None
+    value *= units[unit]
+    if sign == "-":
+        if not allow_negative:
+            return None
+        value = -value
+    if abs(value) > (1024 * 1024 if kind == "gb" else 36500):
+        return None
+    return value
+
+
 def esc(s):
     return html.escape(str(s if s is not None else ""), quote=False)
 
@@ -6274,6 +8279,115 @@ def write(path, value):
     with open(path, "w") as f:
         f.write(str(value))
 ERISBOT_EOF_util_py
+  put_file "$STAGE/erisbot/weather.py" 0644 << 'ERISBOT_EOF_weather_py'
+"""Weather from Open-Meteo (free, no key): city search and a forecast, as Persian text."""
+import json
+import os
+import time
+import urllib.parse
+
+from . import net
+from .util import esc, fa
+
+GEO_URL = os.environ.get("ERISBOT_GEO_URL", "https://geocoding-api.open-meteo.com/v1/search")
+FORECAST_URL = os.environ.get("ERISBOT_FORECAST_URL", "https://api.open-meteo.com/v1/forecast")
+
+# WMO weather codes
+CODES = {0: ("☀️", "صاف"), 1: ("🌤", "تقریباً صاف"), 2: ("⛅️", "نیمه‌ابری"), 3: ("☁️", "ابری"),
+         45: ("🌫", "مه"), 48: ("🌫", "مه یخ‌زده"), 51: ("🌦", "نم‌نم باران"), 53: ("🌦", "نم‌نم باران"),
+         55: ("🌦", "نم‌نم باران شدید"), 56: ("🌧", "نم‌نم یخ‌زده"), 57: ("🌧", "نم‌نم یخ‌زده"),
+         61: ("🌧", "باران کم"), 63: ("🌧", "باران"), 65: ("🌧", "باران شدید"), 66: ("🌧", "باران یخ‌زده"),
+         67: ("🌧", "باران یخ‌زده‌ی شدید"), 71: ("🌨", "برف کم"), 73: ("🌨", "برف"), 75: ("❄️", "برف شدید"),
+         77: ("🌨", "دانه‌ی برف"), 80: ("🌦", "رگبار"), 81: ("🌧", "رگبار"), 82: ("⛈", "رگبار شدید"),
+         85: ("🌨", "رگبار برف"), 86: ("❄️", "رگبار برف شدید"), 95: ("⛈", "رعد و برق"),
+         96: ("⛈", "رعد و برق با تگرگ"), 99: ("⛈", "رعد و برق با تگرگ شدید")}
+DAYS_FA = ["دوشنبه", "سه‌شنبه", "چهارشنبه", "پنج‌شنبه", "جمعه", "شنبه", "یکشنبه"]
+
+
+class WeatherError(Exception):
+    pass
+
+
+def code(c):
+    return CODES.get(int(c or 0), ("🌡", "نامشخص"))
+
+
+def get_json(url, routes):
+    """GET through the first route that answers (direct first, then the bot's proxies)."""
+    last = None
+    for r in routes:
+        try:
+            res = net.request("GET", url, proxy=r, timeout=10, read_timeout=15)
+            if res.status == 200:
+                return json.loads(res.body.decode("utf-8"))
+            last = "HTTP %d" % res.status
+        except (OSError, ValueError) as e:
+            last = str(e) or type(e).__name__
+    raise WeatherError("سرویس هواشناسی جواب نداد (%s)" % last)
+
+
+def search(name, routes):
+    """[(display name, lat, lon, timezone)] for a city name (Persian or English)."""
+    q = urllib.parse.urlencode({"name": name.strip()[:60], "count": 6, "language": "fa", "format": "json"})
+    d = get_json("%s?%s" % (GEO_URL, q), routes)
+    out = []
+    for r in d.get("results") or []:
+        parts = [r.get("name"), r.get("admin1"), r.get("country")]
+        label = "، ".join(p for i, p in enumerate(parts) if p and p not in parts[:i])
+        out.append((label, float(r["latitude"]), float(r["longitude"]), r.get("timezone") or "auto"))
+    return out
+
+
+def forecast(lat, lon, routes):
+    q = urllib.parse.urlencode({
+        "latitude": "%.4f" % lat, "longitude": "%.4f" % lon, "timezone": "auto", "forecast_days": 5,
+        "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,precipitation",
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,sunrise,sunset,uv_index_max",
+        "hourly": "temperature_2m,weather_code,precipitation_probability"})
+    return get_json("%s?%s" % (FORECAST_URL, q), routes)
+
+
+def n(x, digits=0):
+    if x is None:
+        return "؟"
+    return fa(("%." + str(digits) + "f") % x).replace("-", "−")
+
+
+def hhmm(iso):
+    return fa((iso or "")[11:16]) if iso else "؟"
+
+
+def render(city, d):
+    cur = d.get("current") or {}
+    day = d.get("daily") or {}
+    em, txt = code(cur.get("weather_code"))
+    lines = ["%s <b>آب و هوای %s</b>" % (em, esc(city)),
+             "🌡 الان: <b>%s°</b> (حس می‌شود %s°) · %s" % (n(cur.get("temperature_2m")), n(cur.get("apparent_temperature")), txt),
+             "💧 رطوبت %s٪ · 💨 باد %s km/h" % (n(cur.get("relative_humidity_2m")), n(cur.get("wind_speed_10m")))]
+    if cur.get("precipitation"):
+        lines.append("☔️ بارش الان: %s mm" % n(cur["precipitation"], 1))
+    if day.get("time"):
+        lines.append("🌅 طلوع %s · 🌇 غروب %s · ☀️ UV %s" % (hhmm(day["sunrise"][0]), hhmm(day["sunset"][0]),
+                                                         n((day.get("uv_index_max") or [None])[0])))
+        hourly = d.get("hourly") or {}
+        now = cur.get("time") or ""
+        nxt = []
+        for t, temp, c in zip(hourly.get("time") or [], hourly.get("temperature_2m") or [], hourly.get("weather_code") or []):
+            if t > now and t[11:13] in ("00", "03", "06", "09", "12", "15", "18", "21"):
+                nxt.append("%s %s %s°" % (hhmm(t), code(c)[0], n(temp)))
+            if len(nxt) >= 6:
+                break
+        if nxt:
+            lines += ["", "🕒 <b>ساعت‌های بعد</b>", " · ".join(nxt)]
+        lines += ["", "📅 <b>روزهای بعد</b>"]
+        for i, t in enumerate(day["time"]):
+            name = "امروز" if i == 0 else ("فردا" if i == 1 else DAYS_FA[time.strptime(t, "%Y-%m-%d").tm_wday])
+            e, w = code(day["weather_code"][i])
+            pop = (day.get("precipitation_probability_max") or [None] * 5)[i]
+            lines.append("%s %s: %s° تا %s° · %s%s" % (e, name, n(day["temperature_2m_min"][i]), n(day["temperature_2m_max"][i]),
+                                                     w, " · ☔️ %s٪" % n(pop) if pop else ""))
+    return "\n".join(lines)
+ERISBOT_EOF_weather_py
   put_file /usr/local/bin/eris-bot 0755 << 'ERISBOT_EOF_eris_bot'
 #!/usr/bin/python3
 """eris-bot: a Telegram bot for this server (see eris-bot help)."""

@@ -2,9 +2,13 @@
 import re
 import time
 
-from . import marzban, qr
+from . import config, marzban, qr
 from .ui import DANGER, PRIMARY, SUCCESS, Btn, Screen, pager
-from .util import ago, esc, fa, human, log, until
+from .util import ago, esc, fa, fmt_num, human, log, parse_amount, until
+
+
+def config_defaults():
+    return config.DEFAULTS["mz_presets"]
 
 PAGE = 8
 STATUS_FA = {"active": "🟢 فعال", "disabled": "⚪️ غیرفعال", "limited": "🟠 محدود (حجم)", "expired": "🔴 منقضی",
@@ -114,6 +118,7 @@ def register(app):
                  Btn("⏳ +۹۰ روز", "mz_ext", name, 90, style=SUCCESS)],
                 [Btn("📦 +۱۰ گیگ", "mz_gb", name, 10, style=SUCCESS), Btn("📦 +۵۰ گیگ", "mz_gb", name, 50, style=SUCCESS),
                  Btn("📦 +۱۰۰ گیگ", "mz_gb", name, 100, style=SUCCESS)],
+                [Btn("✍️ روز دلخواه", "mz_ext_ask", name, style=SUCCESS), Btn("✍️ حجم دلخواه", "mz_gb_ask", name, style=SUCCESS)],
                 [Btn("♻️ ریست مصرف", "mz_reset", name, confirm="مصرف <b>%s</b> صفر شود؟ (برگشت ندارد)" % esc(name))]]
         if u.get("status") == "disabled":
             rows.append([Btn("▶️ فعال کردن", "mz_enable", name, style=SUCCESS)])
@@ -163,6 +168,66 @@ def register(app):
         log("user %s +%d GB by chat %s", name, gb, ctx.chat_id)
         return user_page(ctx, name, "✅ %s گیگ اضافه شد" % fa(gb) if done else "حجم این کاربر نامحدود است")
 
+    # -------------------------------------------------------- any number of days / GB for one user
+    @app.action("mz_ext_ask", write=True, view=False)
+    def ext_ask(ctx, name):
+        return ctx.ask_text("mz_ext_in", "⏳ <b>%s</b>: چند روز اضافه شود؟\nمثال: <code>12</code> · <code>2 ماه</code> · "
+                            "<code>6 ساعت</code> · منفی کم می‌کند: <code>-3</code>\n<code>0</code> = انقضا برداشته شود "
+                            "(نامحدود)\nاگر الان نامحدود است، از همین حالا حساب می‌شود." % esc(name), name, back=("mz_user", [name]))
+
+    @app.text_input("mz_ext_in")
+    def ext_input(ctx, text, msg, name):
+        days = parse_amount(text, "days", allow_negative=True)
+        ctx.msg_id = None
+        if days is None:
+            return Screen("❌ «%s» عدد روز نیست." % esc(text[:30]), [[Btn("✍️ دوباره", "mz_ext_ask", name, style=SUCCESS)]],
+                          back=("mz_user", [name]))
+        u = mz.user(name)
+        if days == 0:
+            mz.modify(name, expire=0)
+            note = "♾ انقضا برداشته شد (نامحدود)"
+        elif not u.get("expire"):
+            if days < 0:
+                return user_page(ctx, name, "انقضای این کاربر نامحدود است؛ چیزی کم نشد")
+            mz.modify(name, expire=int(time.time() + days * 86400))
+            note = "⏳ انقضا: %s از الان" % days_text(days)
+        else:
+            mz.extend(name, days)
+            note = "⏳ %s %s" % (days_text(abs(days)), "اضافه شد" if days > 0 else "کم شد")
+        log("user %s expire %+.2f days by chat %s", name, days, ctx.chat_id)
+        return user_page(ctx, name, note)
+
+    @app.action("mz_gb_ask", write=True, view=False)
+    def gb_ask(ctx, name):
+        return ctx.ask_text("mz_gb_in", "📦 <b>%s</b>: چند گیگ اضافه شود؟\nمثال: <code>7</code> · <code>2.5</code> · "
+                            "<code>300 مگ</code> · منفی کم می‌کند: <code>-5</code>\n<code>0</code> = حجم نامحدود\n"
+                            "اگر الان نامحدود است، سقف = مصرف فعلی + این مقدار." % esc(name), name, back=("mz_user", [name]))
+
+    @app.text_input("mz_gb_in")
+    def gb_input(ctx, text, msg, name):
+        gb = parse_amount(text, "gb", allow_negative=True)
+        ctx.msg_id = None
+        if gb is None:
+            return Screen("❌ «%s» عدد حجم نیست." % esc(text[:30]), [[Btn("✍️ دوباره", "mz_gb_ask", name, style=SUCCESS)]],
+                          back=("mz_user", [name]))
+        u = mz.user(name)
+        if gb == 0:
+            mz.modify(name, data_limit=0)
+            note = "♾ حجم نامحدود شد"
+        elif not u.get("data_limit"):
+            if gb < 0:
+                return user_page(ctx, name, "حجم این کاربر نامحدود است؛ چیزی کم نشد")
+            mz.modify(name, data_limit=int((u.get("used_traffic") or 0) + gb * GB))
+            note = "📦 سقف: مصرف فعلی + %s" % gb_text(gb)
+        else:
+            new = int(u["data_limit"] + gb * GB)
+            if new <= 0:
+                return user_page(ctx, name, "❌ حجم کمتر از صفر می‌شد؛ چیزی تغییر نکرد")
+            mz.modify(name, data_limit=new)
+            note = "📦 %s %s" % (gb_text(abs(gb)), "اضافه شد" if gb > 0 else "کم شد")
+        log("user %s data %+.3f GB by chat %s", name, gb, ctx.chat_id)
+        return user_page(ctx, name, note)
+
     @app.action("mz_reset", write=True, steps=1, view=False)
     def reset(ctx, name):
         mz.reset(name)
@@ -210,26 +275,70 @@ def register(app):
         ctx.msg_id = None
         return step_data(ctx)
 
-    def step_data(ctx):
+    def presets(kind):
+        p = (app.conf.get("mz_presets") or {}).get(kind) or config_defaults()[kind]
+        return [x for x in p if isinstance(x, (int, float)) and x > 0][:8]
+
+    def arm(ctx, kind, *args):
+        """Take the next text message as the answer to this step (the buttons still work)."""
+        ctx.session()["input"] = {"kind": kind, "args": list(args), "exp": time.time() + 600}
+
+    def gb_text(gb):
+        return "%s گیگ" % fmt_num(gb) if gb else "نامحدود"
+
+    def days_text(days):
+        if not days:
+            return "بی‌نهایت"
+        if days < 1:
+            return "%s ساعت" % fmt_num(round(days * 24, 2))
+        return "%s روز" % fmt_num(days)
+
+    def preset_rows(action, values, label, unlimited):
+        btns = [Btn(label(v), action, v, style=SUCCESS) for v in values] + [Btn(unlimited, action, 0, style=SUCCESS)]
+        return [btns[i:i + 3] for i in range(0, len(btns), 3)]
+
+    def step_data(ctx, error=None):
         w = wiz(ctx)
-        rows = [[Btn("%s گیگ" % fa(g), "mz_new_gb", g, style=SUCCESS) for g in (10, 20, 50)],
-                [Btn("%s گیگ" % fa(g), "mz_new_gb", g, style=SUCCESS) for g in (100, 200)] + [Btn("♾ نامحدود", "mz_new_gb", 0, style=SUCCESS)],
-                [Btn("✖️ لغو", "mz", style=PRIMARY)]]
-        return Screen("➕ <b>ساخت کاربر %s</b> — قدم ۲ از ۴\nحجم:" % esc(w.get("name")), rows)
+        arm(ctx, "mz_new_gb_in")
+        rows = preset_rows("mz_new_gb", presets("gb"), gb_text, "♾ نامحدود") + [[Btn("✖️ لغو", "mz", style=PRIMARY)]]
+        return Screen("%s➕ <b>ساخت کاربر %s</b> — قدم ۲ از ۴\n📦 <b>حجم</b>: یکی از دکمه‌ها، یا هر عددی بفرستید.\n"
+                      "مثال: <code>15</code> (گیگ) · <code>2.5</code> · <code>500 مگ</code> · <code>1 ترا</code> · "
+                      "<code>0</code> = نامحدود" % (error and error + "\n\n" or "", esc(w.get("name"))), rows)
+
+    @app.text_input("mz_new_gb_in")
+    def new_gb_input(ctx, text, msg):
+        gb = parse_amount(text, "gb")
+        ctx.msg_id = None
+        if gb is None or gb < 0:
+            return step_data(ctx, "❌ «%s» عدد حجم نیست." % esc(text[:30]))
+        return new_gb(ctx, gb)
 
     @app.action("mz_new_gb", write=True, view=False)
-    def new_gb(ctx, gb):
-        wiz(ctx)["gb"] = int(gb)
+    def new_gb(ctx, gb, error=None):
         w = wiz(ctx)
-        rows = [[Btn("%s روز" % fa(d), "mz_new_days", d, style=SUCCESS) for d in (7, 30, 60)],
-                [Btn("%s روز" % fa(d), "mz_new_days", d, style=SUCCESS) for d in (90, 180)] + [Btn("♾ بی‌نهایت", "mz_new_days", 0, style=SUCCESS)],
-                [Btn("✖️ لغو", "mz", style=PRIMARY)]]
-        return Screen("➕ <b>ساخت کاربر %s</b> — قدم ۳ از ۴\nحجم: %s\nمدت:" % (esc(w.get("name")), "%s گیگ" % fa(gb) if gb else "نامحدود"), rows)
+        if "name" not in w:
+            return Screen("⌛ این ساخت منقضی شده؛ دوباره شروع کنید.", back=("mz", []))
+        w["gb"] = float(gb)
+        arm(ctx, "mz_new_days_in")
+        rows = preset_rows("mz_new_days", presets("days"), days_text, "♾ بی‌نهایت") + [[Btn("✖️ لغو", "mz", style=PRIMARY)]]
+        return Screen("%s➕ <b>ساخت کاربر %s</b> — قدم ۳ از ۴\nحجم: %s\n⏳ <b>مدت</b>: یکی از دکمه‌ها، یا هر عددی بفرستید.\n"
+                      "مثال: <code>45</code> (روز) · <code>2 ماه</code> · <code>12 ساعت</code> · <code>1 سال</code> · "
+                      "<code>0</code> = بی‌نهایت" % (error and error + "\n\n" or "", esc(w.get("name")), gb_text(w["gb"])), rows)
+
+    @app.text_input("mz_new_days_in")
+    def new_days_input(ctx, text, msg):
+        days = parse_amount(text, "days")
+        ctx.msg_id = None
+        if days is None or days < 0:
+            return new_gb(ctx, wiz(ctx).get("gb", 0), "❌ «%s» عدد روز نیست." % esc(text[:30]))
+        return new_days(ctx, days)
 
     @app.action("mz_new_days", write=True, view=False)
     def new_days(ctx, days):
         w = wiz(ctx)
-        w["days"] = int(days)
+        if "name" not in w or "gb" not in w:
+            return Screen("⌛ این ساخت منقضی شده؛ دوباره شروع کنید.", back=("mz", []))
+        w["days"] = float(days)
         inb = mz.inbounds()
         w["all"] = {p: [i["tag"] for i in lst] for p, lst in inb.items() if lst}
         w["sel"] = {p: list(t) for p, t in w["all"].items() if p == "vless"} or {p: list(t) for p, t in w["all"].items()}
@@ -246,8 +355,7 @@ def register(app):
                 rows.append([Btn(("✅ " if on else "⬜️ ") + "%s (%s)" % (t, p), "mz_new_inb", p, t, style=SUCCESS if on else PRIMARY)])
         rows.append([Btn("✅ ساخت کاربر", "mz_new_go", style=SUCCESS), Btn("✖️ لغو", "mz", style=PRIMARY)])
         return Screen("➕ <b>ساخت کاربر %s</b> — قدم ۴ از ۴\nحجم: %s · مدت: %s\nاینباندها را انتخاب کنید:" % (
-            esc(w["name"]), "%s گیگ" % fa(w["gb"]) if w.get("gb") else "نامحدود",
-            "%s روز" % fa(w["days"]) if w.get("days") else "بی‌نهایت"), rows)
+            esc(w["name"]), gb_text(w.get("gb")), days_text(w.get("days"))), rows)
 
     @app.action("mz_new_inb", write=True, view=False)
     def new_inb(ctx, proto, tag):
@@ -269,7 +377,7 @@ def register(app):
             ctx.answer("حداقل یک اینباند انتخاب کنید.", alert=True)
             return step_inbounds(ctx)
         expire = int(time.time() + w["days"] * 86400) if w.get("days") else None
-        mz.create(w["name"], sel, expire=expire, data_limit=w["gb"] * GB if w.get("gb") else 0, note="eris-bot")
+        mz.create(w["name"], sel, expire=expire, data_limit=int(w["gb"] * GB) if w.get("gb") else 0, note="eris-bot")
         log("user %s created by chat %s", w["name"], ctx.chat_id)
         name = w["name"]
         ctx.session()["mz_new"] = {}

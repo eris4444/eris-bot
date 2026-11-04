@@ -10,6 +10,7 @@ from .ui import Btn, Screen
 from .util import esc, log
 
 INPUT_TTL = 600
+COMMANDS = {"/ai": "ai", "/files": "nas", "/weather": "wx"}
 
 
 class Action:
@@ -39,7 +40,7 @@ class Ctx:
         return self.app.bot.send(self.chat_id, text, markup)
 
     def ask_text(self, kind, prompt, *args, back=None):
-        """Wait for the next text message of this chat (search, a port, a name, ...)."""
+        """Wait for the next message of this chat (search, a port, a name, a file, a location...)."""
         self.app.session(self.chat_id)["input"] = {"kind": kind, "args": list(args), "exp": time.time() + INPUT_TTL}
         rows = [[Btn("✖️ لغو", "cancel_input", *(back or ("menu", [])), style=ui.PRIMARY)]]
         return Screen(prompt, rows)
@@ -72,6 +73,11 @@ class App:
         self.pool = ThreadPoolExecutor(max_workers=workers) if workers else None
         self.stop_evt = threading.Event()
         self.ignored = {}
+        self.weather_tick = None
+        if self.state.get("styles_refused") and tg.stale_refusal(self.state.get("styles_refused_reason") or ""):
+            # 1.1.0 turned colours off when a button was pressed twice ("message is not modified")
+            self.state.update(styles_refused=False, styles_refused_reason="")
+            log("button colours back on (the old refusal was an unchanged edit, not the API refusing colours)")
         from . import screens
         screens.register(self)
 
@@ -225,6 +231,9 @@ class App:
             if text in (ui.DASH_TEXT, "/dashboard"):
                 sess["input"] = None
                 return self.run(ctx, "dash", [])
+            if text in COMMANDS:                   # also ends a chat with Claude/Codex or an upload
+                sess["input"] = None
+                return self.run(ctx, COMMANDS[text], [])
             inp = sess.get("input")
             if inp and inp["exp"] > time.time():
                 fn, write = self.inputs.get(inp["kind"], (None, True))
@@ -239,6 +248,13 @@ class App:
                 if isinstance(res, Screen):
                     self.show(ctx, res)
                 return res
+            from .s_files import incoming_file
+            f = incoming_file(msg)
+            if f:                                  # a file without a question: offer to save it on the NAS
+                return self.run(ctx, "nas_incoming", list(f))
+            loc = msg.get("location")
+            if isinstance(loc, dict) and "latitude" in loc:
+                return self.run(ctx, "wx_pick", ["موقعیت من", loc["latitude"], loc["longitude"]])
             if text and not text.startswith("/") and self.marzban.available():
                 return self.run(ctx, "mz_search", [text, 0])
             return self.run(ctx, "menu", [])
@@ -317,6 +333,8 @@ class App:
             try:
                 self.sender.tick()
                 self.daily_report()
+                if self.weather_tick:
+                    self.weather_tick()
                 self.cbs.save()
             except Exception as e:
                 log("schedule round failed: %r", e)
