@@ -9,7 +9,8 @@ mode() { stat -c %a "$1"; }
 
 bash "$inst" > /tmp/install.log 2>&1 || { cat /tmp/install.log; fail "installer"; }
 cat /tmp/install.log
-[ "$(eris-bot version)" = 1.1.0 ] || fail "version"
+want=$(python3 -c 'import sys; sys.path.insert(0, "/usr/local/lib/eris-bot"); import erisbot; print(erisbot.VERSION)')
+[ "$(eris-bot version)" = "$want" ] || fail "version ($(eris-bot version), expected $want)"
 for f in /usr/local/bin/eris-bot /usr/local/lib/eris-bot/erisbot/app.py /usr/local/lib/eris-bot/erisbot/fand.py \
          /etc/systemd/system/eris-bot.service /etc/systemd/system/eris-fan.service /usr/local/sbin/eris-bot-uninstall \
          /etc/eris-bot/config.json; do
